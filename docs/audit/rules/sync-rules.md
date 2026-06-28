@@ -85,6 +85,19 @@ IDs are stable (`SR-n`) so decisions, findings, and tests can cite them.
 - **How tested:** the two-instance integration scenario: diverge two folders,
   let them sync, assert equal roots; also assert the O(log n) diff property —
   one byte changed flips exactly that leaf's branch and the root, nothing else.
+- **Amendment (WS-0, CDD-8 — the oracle holds at quiescence, not at every instant)**
+  *(sources: tree-critic-1, tree-critic-4; see
+  `docs/audit/decisions/ws0/concurrency-oracle-rule-amendments.md`).* "after changes
+  settle" is load-bearing. The equal-root oracle holds **at quiescence**, after
+  propagation settles — **not** at every instant. During normal propagation, an
+  in-flight transfer, or tombstone-GC skew the two roots are transiently unequal, and
+  that is the **correct** "not yet converged" signal, not a divergence bug (tombstone
+  state *is* replicated state, so a mid-GC root difference is a genuine pre-convergence
+  state). A consumer — notably the Phase 6 flow-verifier — MUST **quiesce-then-compare**
+  and never treat an instantaneous root inequality as "diverged." (Related scope, same
+  decision: **empty directories are not synced** — a directory deletion is the deletion
+  of all contained files — so an empty dir is symmetrically absent from both trees and
+  never breaks the oracle.)
 
 ## SR-6 — Only broadcast a hash after a *confirmed local* change
 
@@ -237,7 +250,7 @@ IDs are stable (`SR-n`) so decisions, findings, and tests can cite them.
 | Invariant | WS acceptance phrasing (plan/agent_roster.md) |
 |---|---|
 | SR-1, SR-2 | "a transfer killed mid-stream leaves no corrupt file (temp discarded)" |
-| SR-5 | "two instances with divergent folders converge to identical root hashes" |
+| SR-5 | "two instances with divergent folders converge to identical root hashes" (asserted **at quiescence** — CDD-8) |
 | SR-6, SR-8 | "receiving a file does not trigger a re-broadcast loop" |
 | SR-7, SR-9 | "simultaneous edits to one file produce a .sync-conflict copy with neither version lost" |
 | SR-10 | deletion propagation without resurrection (deletion scenario) |

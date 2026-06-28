@@ -93,6 +93,16 @@ The daemon runs three concurrent listeners with different lifecycles:
 - **Why / pattern source:** the select-on-`Done()` + channel fan-in pattern and
   the "context flows down, WaitGroup gathers up" structure are the consensus
   graceful-shutdown pattern ([goperf.dev, *Efficient Context Management*](https://goperf.dev/01-common-patterns/context/); [oneuptime, *How Context Cancellation Propagates*, 2026-01-23](https://oneuptime.com/blog/post/2026-01-23-go-context-cancellation/view), both accessed 2026-06-28).
+- **Amendment (WS-0, CDD-1 — outbound never blocks the select loop)** *(source:
+  concurrency-critic-2; see `docs/audit/decisions/ws0/concurrency-oracle-rule-amendments.md`).*
+  Symmetric to the cancellable-read rule above: the reconcile core **must not perform
+  a blocking send to a peer from its main `select` loop**. Outbound is owned by the
+  **per-conn writer goroutine** and is **buffered-with-shed** — if a peer's outbound
+  buffer is full, that **peer is dropped**, the loop is never blocked. Bulk `RESPONSE`
+  streaming runs in its **own GR-3 spawn-and-own goroutine**, not on the select loop.
+  This severs the back-pressure deadlock cycle (a cycle that only exists if the engine
+  blocks on outbound). Exercised by WS-2's writer-owned-outbound conn test and WS-4's
+  bidirectional back-pressure integration test.
 
 ---
 
@@ -118,6 +128,17 @@ received file rebuilds the tree).
   lock + immutable snapshots to avoid the problem entirely.
 - **How tested:** `go test -race` on a scenario that diffs against a peer while
   the watcher fires writes; a deadlock detector test with a bounded timeout.
+- **Amendment (WS-0, CDD-1 — what the one lock actually guards)** *(source:
+  concurrency-critic-1; see `docs/audit/decisions/ws0/concurrency-oracle-rule-amendments.md`).*
+  "the tree" is shorthand for the **reconcile core's in-memory state**: the Merkle
+  tree **plus** per-peer ack / last-index state **plus** the apply-time
+  **expected-hash record** (SR-8). All of it is serialised by the one `RWMutex`. By
+  contrast, **non-tree shared state that does not live in the reconcile core** — the
+  discovery registry, the scanloop debounce map — is **not** lock-guarded: it is owned
+  by a **GR-4 single-goroutine actor** that emits `peerEvents` / `fsChanges` ("share by
+  communicating"), never a shared map a second goroutine touches. Exercised by WS-3's
+  discovery `-race` test (announce + evict + dial) and WS-4's watcher-burst-while-apply
+  `-race` test.
 
 ---
 
@@ -260,6 +281,19 @@ fsnotify's own documentation pins these realities (all quotes
 - **Why:** the data this program guards is the user's files; a race that
   double-applies or drops a change is data loss, not a flake. The race detector
   is the cheapest defence and is already in CI.
+- **Amendment (WS-0, CDD-1 — fan-in channels are never closed)** *(source:
+  concurrency-critic-4; see `docs/audit/decisions/ws0/concurrency-oracle-rule-amendments.md`).*
+  "exactly one closer (the sender side)" governs **single-sender** channels (e.g. a
+  per-conn outbound channel). A **fan-in** channel — many senders, one receiver
+  (`inboundMsgs`, `peerEvents`, `fsChanges`) — is **never closed**: shutdown is `ctx`
+  cancellation **plus** a `WaitGroup` over the senders; the receiver drains until the
+  senders have returned. Closing a fan-in channel from any single sender would risk a
+  send-on-closed panic in the others, so the rule is "don't close it," not "elect a
+  closer." Per-conn `conn.Close()` is made **idempotent and owner-only** via
+  `sync.Once` (hygiene: a second `net.Conn.Close()` merely returns an error, and a
+  `Close` concurrent with a blocked `Read`/`Write` is supported — it is the unblock
+  mechanism). Exercised by WS-2's connect/disconnect-churn leak test (goroutines **and**
+  the engine per-peer map return to baseline).
 
 ---
 
@@ -268,7 +302,8 @@ fsnotify's own documentation pins these realities (all quotes
 - [ ] Root `ctx` from `signal.NotifyContext`; threaded everywhere; no deep `Background()`.
 - [ ] Every goroutine: `select`s on `ctx.Done()` **and** has a `WaitGroup` owner.
 - [ ] Blocking network reads cancelled via deadline/close, not hope.
-- [ ] Tree guarded by one `RWMutex`; **zero I/O under the lock**; documented lock order.
+- [ ] Reconcile-core state (tree **+** per-peer ack/last-index **+** expected-hash record) guarded by one `RWMutex`; **zero I/O under the lock**; documented lock order. Non-tree shared state (discovery registry, debounce map) is a GR-4 actor, not lock-guarded.
+- [ ] Outbound never blocks the select loop (per-conn writer owns it, buffered-with-shed; bulk RESPONSE in its own GR-3 goroutine). Fan-in channels (`inboundMsgs`/`peerEvents`/`fsChanges`) are **never closed**; `conn.Close()` is `sync.Once` owner-only.
 - [ ] Errors wrapped with `%w`; sentinels + `errors.Is/As`; nothing internal leaked to peers.
 - [ ] Frame I/O: `io.ReadFull` + big-endian + max-length guard; no `gob` from the network.
 - [ ] fsnotify treated as advisory: per-dir watches, watch-set reconciled, `Errors`→rescan, debounce ~150 ms.
