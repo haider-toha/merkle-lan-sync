@@ -1,0 +1,47 @@
+# Cross-platform CI matrix — this is the artifact that closes the OS gap the
+# README calls out: the suite runs on a real windows-latest runner, not just
+# the Mac it was written on. Phase 6 (evidence-generator) refines this file.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build+test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test (race)
+        run: go test ./... -race -count=1
+
+  cross-compile:
+    name: cross-compile windows/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: GOOS=windows build
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build ./cmd/msync
