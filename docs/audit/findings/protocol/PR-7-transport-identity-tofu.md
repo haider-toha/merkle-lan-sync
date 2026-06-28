@@ -108,3 +108,20 @@ cryptographically verified.
   they must be authenticated).
 - Lands in `internal/transport/{identity.go, tls.go, dial.go, conn.go}`,
   `internal/protocol/deviceid.go`.
+
+## Implementation status (WS-0 — partial)
+
+**Landed in WS-0** — commit `801d0949561e648646782b10a3d514abd0981242` on branch `feat/merkle-sync-engine`
+(`internal/protocol/deviceid.go`): the §3 identity **primitives** —
+`DeviceIDFromCert(der) = SHA-256(cert DER)` (deterministic `[32]byte`) and `Short()`
+= the high 64 bits big-endian (the version-vector counter key), plus hex `String()`
+and `ParseDeviceID`. Tests (`deviceid_test.go`, green under `-race`):
+`TestDeviceIDFromCert_Deterministic`, `TestShort_HighBits`,
+`TestShort_IsVersionVectorKey`, `TestDeviceID_HexRoundTrip`, `TestDeviceID_Comparable`
+— this is §7 obligation #4.
+
+**Remaining (other workstreams) — this finding stays `open`:** §4 hardening
+(`tls.Config.VerifyConnection` pinning `SHA-256(PeerCertificates[0].Raw)` against the
+allow-list, `MinVersion: VersionTLS13`, HELLO re-asserting the DeviceID), §5 the TOFU
+allow-list, and §7 obligations 1–3 are all WS-2 (`internal/transport`). Representation
+choice logged in `docs/audit/decisions/ws0/deviceid-type-and-derivation.md`.

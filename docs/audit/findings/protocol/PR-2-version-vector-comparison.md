@@ -3,7 +3,8 @@
 - Phase / role: Phase 2 — protocol-researcher
 - Severity: **high** (the comparison result drives every reconciliation branch;
   getting concurrent-vs-causal wrong is either silent data loss or a conflict storm)
-- Status: open (research finding; backs `decisions/protocol/vv-counter-seeding.md`
+- Status: fixed (WS-0 — VV Compare/Merge/Bump/encode landed + `-race` tested; see
+  Implementation status below. Research finding; backs `decisions/protocol/vv-counter-seeding.md`
   and `vv-pruning-counter-cleanup.md`)
 - Reads-first honoured: `sync-rules.md` (SR-4, SR-6, SR-9, SR-10),
   `findings/literature/version-vectors.md`, `findings/literature/syncthing-bep.md` §4,
@@ -129,3 +130,27 @@ cases (dominates / dominated / concurrent / equal / tombstone-dominates-absent).
 - Findings: PR-1 (compare runs in diff step 4), PR-3 (Concurrent → tiebreaker),
   PR-4 (tombstone dominance), PR-6 (Bump only on local authorship);
   `literature/version-vectors.md` (verbatim source + failure modes).
+
+## Implementation status (WS-0)
+
+**Fixed in WS-0** — commit `801d0949561e648646782b10a3d514abd0981242` on branch `feat/merkle-sync-engine`.
+`internal/protocol/versionvector.go` implements the full §2 decision procedure
+(`Compare` → `Equal` / `Dominates` / `DominatedBy` / `Concurrent`, a missing entry
+read as 0), the §3 operations (`Bump` = pure `prev+1`, `Merge` = pointwise max,
+`Get`, `Copy`, `NewVersionVector` normalisation), and the canonical sorted /
+no-zero-value `Encode` + `DecodeVersionVector` grammar (leaf-shape §D.3). Every op
+is copy-on-write (a fresh backing array; the receiver is never mutated).
+
+Tests (`versionvector_test.go`, all green under `-race`):
+`TestCompare_Antisymmetry` (named table + a 5000-case seeded property — the §7
+proof obligation), `TestCompare_Cases` (incl. tombstone-dominates-absent, the
+SR-10 substrate), `TestMerge_PointwiseMax`, `TestBump_PrevPlusOne`,
+`TestOps_CopyOnWrite` + `TestOps_CopyOnWrite_Race`, `TestEncode_GoldenVector`,
+`TestDecodeVersionVector_RejectsMalformed`, `TestNewVersionVector_Normalize`.
+
+Applied in later workstreams (uses these ops; not part of this finding's core
+claim): the cold-start reseed `Merge`-before-authorship and the
+equal-VV/differing-content backstop in WS-4 (`apply.go` / `conflict.go`), and the
+ack-gated `DropCounter` in WS-4 (`vv-pruning-counter-cleanup.md`). Representation
+choice logged in
+`docs/audit/decisions/ws0/versionvector-representation-and-cow-ops.md`.

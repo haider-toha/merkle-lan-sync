@@ -218,3 +218,32 @@ Key protocol invariants surfaced by the state machine:
   GR-7 (no gob), GR-8 (`io.ReadFull` + guard).
 - Findings: PR-2 (VV compare driving step 4), PR-3 (conflict), PR-4 (tombstones),
   PR-6 (sync-loop invariant on INDEX_UPDATE), PR-7 (TLS/TOFU identity in steps 1–2).
+
+## Implementation status (WS-0 — partial)
+
+**Landed in WS-0** — commit `801d0949561e648646782b10a3d514abd0981242` on branch `feat/merkle-sync-engine`
+(`internal/protocol/{framing.go, messages.go, doc.go}`):
+
+- **§2 framing in full:** `[4-byte BE len][1-byte type][payload]`, `MaxFrameLen`
+  (16 MiB) validated **before allocating the body**, `io.ReadFull` for both header
+  and body, typed `ErrFrameTooLarge` / `ErrZeroLength`. The complementary sender
+  budget is pinned: `MaxChunkLen = MaxFrameLen − FrameTypeLen(1) − ResponseHeaderLen(5)`,
+  `WriteFrame` rejects an over-`MaxFrameLen` frame, and the `RESPONSE` builder rejects
+  an over-`MaxChunkLen` chunk with `ErrChunkTooLarge` — fails on the sender, never as
+  a peer-dropping error on the victim (CDD-2 / protocol-critic-1's sender-budget kernel).
+- **§3 catalogue + split unknown-type policy:** seven frozen types; `MsgType.RecvAction`
+  is total over all 256 bytes (0x00 → fatal, 0x01–0x07 → dispatch, 0x08+ → skip).
+- **§4 message envelopes** for all seven types encode/decode round-trip; the
+  `INDEX`/`INDEX_UPDATE` `wireFileInfo` region is carried as an **opaque body** (the
+  explicit WS-0/WS-1 seam).
+- **§6 test obligations 1–5** (`framing_test.go`, `messages_test.go`, green under `-race`),
+  including split-read survival (`iotest.OneByteReader`), oversized/zero rejection with
+  no body read, the `MaxChunkLen` boundary, and skip-unknown-frame-then-continue.
+
+**Remaining (other workstreams) — this finding stays `open`:**
+- §5 connection lifecycle / handshake state machine → WS-2 (`internal/transport`).
+- §4 `wireFileInfo` byte grammar (the opaque body) → WS-1 (`internal/merkle`).
+- §6 obligation 6 (HELLO root-hash skip-INDEX short-circuit) → WS-4 integration.
+
+Decisions: `docs/audit/decisions/ws0/framing-read-write-api-and-size-budget.md`,
+`docs/audit/decisions/ws0/message-envelope-codec-and-unknown-type-policy.md`.
