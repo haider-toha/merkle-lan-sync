@@ -2,7 +2,7 @@
 
 - Area: phase6 / evidence-generator
 - Date: 2026-06-29
-- Status: accepted
+- Status: accepted — implemented in commit `b2b298b` (test/integration only)
 
 ## Context
 

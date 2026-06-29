@@ -2,7 +2,7 @@
 
 - ID: REV-FLAKE-1
 - Severity: low (liveness / test-robustness — NOT correctness)
-- Status: resolved (harness de-flaked; production unaffected)
+- Status: resolved (harness de-flaked; production unaffected) — landed in commit `b2b298b`
 - Date: 2026-06-29
 - Evidence: reproductions below; fix in `test/integration/helpers.go` + `sync_test.go`;
   decision `docs/audit/decisions/phase6/convergence-timeout-deflake.md`.
