@@ -3,19 +3,42 @@
 - Phase / role: Phase 2 — protocol-researcher
 - Severity: **high** (this is the literal no-data-loss contract; an asymmetric or
   non-deterministic winner rule means the two peers diverge or one version is lost)
-- Status: **fixed** (WS-4) — the total+commutative winner `W` (`aWins`/`winner`/
-  `loserOf`), the deterministic UTC-whole-second `.sync-conflict` copy name
-  (`conflictName`), and the symmetric keep-both materialisation (winner at the path
-  with merged VV; loser preserved as a copy, never deleted) are implemented in
-  `internal/reconcile/{conflict,apply,engine}.go` and verified by
-  `reconcile_test.go` (`TestW_Commutative`, `TestConflict_CopyName*`,
-  `TestResolver_*`) + integration `TestConflict_NeitherVersionLostSymmetricName`
-  (both peers converge to the same `{f.txt, byte-identical .sync-conflict copy}`,
-  neither version lost). Decisions
-  `docs/audit/decisions/ws4/resolver-totality-conflict-identity-and-sync-loop.md`.
-  Commit `af12de099165f38e11556555acc986b9ba385f24`. (Implements SR-7; no new
-  decision needed — SR-7 already pins the policy, this finding proves it
-  deterministic + symmetric.)
+- Status: **fixed** (Phase 7 round 1, commit `9d1e0cca7ac3ef7bd66e042c665103f42947d9fc`).
+  The total+commutative winner `W` (`aWins`/`winner`/`loserOf`) and the deterministic
+  UTC-whole-second `.sync-conflict` copy name (`conflictName`) were sound from WS-4
+  (`af12de0`). But the WS-4 "fixed" verdict was **REFUTED by all three Phase 6 skeptics**:
+  the no-data-loss CONTRACT (SR-7/SR-9) was broken in the EXECUTION layer (the resolver
+  was fine). Four defects, now fixed in Phase 7:
+  (A) live-vs-live under `fetchQ` saturation — the loser copy and the winner overwrite
+  were separate non-blocking enqueues; a dropped copy + a slipped-through winner destroyed
+  the loser (skeptic #1/#3);
+  (B) delete-vs-modify where the delete wins — `execute` removed the original via a
+  synchronous `applyTombstone` BEFORE the async copy ran, losing the modification (skeptic
+  #2 §1; reproduced deterministically);
+  (C) §6 MAX_PATH bounding was unwired — `WouldExceedMaxPath` never called from reconcile
+  (skeptic #2 §2);
+  (D) cross-peer FALSE DOMINATION — `conflictPlan` merged the loser's VV into the winner,
+  so a broadcast winning tombstone dominated the loser's still-live edit on its own
+  custodian (and on any 3rd peer holding it), which then plain-deleted it without a copy
+  (found while building the (B) integration test).
+  Fix: (A)+(B) couple the loser-copy with the winner's install into ONE atomic puller task
+  gating the destructive step on the copy landing; (D) the winner keeps its OWN VV (no
+  false-dominating merge — the winner leaf is identical on both peers, so convergence is
+  preserved while every holder of the loser now sees a true Concurrent conflict and
+  preserves it); (C) `execute` refuses+flags (`ErrMaxPathExceeded`) an over-MAX_PATH copy,
+  never overwriting the loser. Implemented in `internal/reconcile/{apply,engine,transfer}.go`,
+  verified by `reconcile_test.go` (`TestResolver_DeleteWinsPreservesModification`,
+  `TestConflict_DeleteWins_ModificationPreservedAsCopy`,
+  `TestConflict_WinnerGatedOnCopy_NoOverwriteWhenCopyFails`,
+  `TestConflict_FullQueueDropsCoupledTaskAtomically`, `TestConflict_RefusesOverMaxPathCopy`,
+  plus the original `TestW_Commutative`/`TestConflict_CopyName*`/`TestResolver_*`) and
+  integration `TestConflict_NeitherVersionLostSymmetricName` +
+  `TestConflict_DeleteVsModify_NoLossBothPeers` (forced delete-wins; the losing
+  modification survives on BOTH peers). `go build ./... && go test ./... -race` green;
+  `GOOS=windows GOARCH=amd64` build clean. Decisions
+  `docs/audit/decisions/phase7/PR-3-conflict-no-data-loss-ordering.md` (amends
+  `docs/audit/decisions/ws4/resolver-totality-conflict-identity-and-sync-loop.md`: the
+  conflict winner no longer merges the loser's VV).
 - Reads-first honoured: `sync-rules.md` SR-4/SR-7/SR-9, `findings/literature/syncthing-bep.md`
   §4.6/§5, `findings/literature/version-vectors.md` §4.6/FM-6, `findings/codebases/syncthing-source.md`
   A2-3, SKILL §3.
