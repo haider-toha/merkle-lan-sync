@@ -433,6 +433,46 @@ func TestRename_PropagatesNoLoss(t *testing.T) {
 	}
 }
 
+// PR-5 (Phase 7): a cross-peer rename whose NEW path sorts AFTER the old (a.txt -> z.txt)
+// converges with no data loss across two live engines. This is the ordering that the
+// pre-fix receiver mishandled: merkle.Diff is path-sorted, so the old path's tombstone was
+// applied (synchronous os.Remove) BEFORE the async create could reuse the old bytes,
+// forcing a needless full network fetch. The fix couples the two (reuse-then-remove), so
+// this ordering is now order-independent. The zero-REQUEST property is asserted precisely
+// at the engine-receiver level (reconcile.TestRename_CrossPeer_ZeroNetwork_OrderIndependent,
+// where REQUEST frames are observable pre-TLS); here the end-to-end invariant is
+// convergence + no-loss for the previously-mishandled sort order.
+func TestRename_AfterSortingOrder_PropagatesNoLoss(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	const payload = "rename-a-to-z-keep-every-byte-no-loss-0123456789"
+	write(t, dirA, "a.txt", payload) // new path (z.txt) will sort AFTER the old (a.txt)
+
+	a := startNode(t, ctx, dirA)
+	b := startNode(t, ctx, dirB)
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+	if got, ok := read(t, b.dir, "a.txt"); !ok || got != payload {
+		t.Fatalf("precondition: B should hold a.txt=%q, got %q ok=%v", payload, got, ok)
+	}
+
+	if err := os.Rename(filepath.Join(dirA, "a.txt"), filepath.Join(dirA, "z.txt")); err != nil {
+		t.Fatal(err)
+	}
+	waitConverged(t, a, b, budgetConverge)
+
+	for name, n := range map[string]*node{"A": a, "B": b} {
+		if got, ok := read(t, n.dir, "z.txt"); !ok || got != payload {
+			t.Fatalf("node %s: z.txt=%q ok=%v, want %q (rename lost bytes)", name, got, ok, payload)
+		}
+		if _, ok := read(t, n.dir, "a.txt"); ok {
+			t.Fatalf("node %s: a.txt still present after rename (stale copy not removed)", name)
+		}
+	}
+}
+
 // WS-4 #3 / SR-1 / SR-2: a transfer severed mid-stream leaves NO corrupt or partial
 // destination file and NO leftover temp on the receiver (verify-before-rename), and
 // recovers byte-exact on reconnect. B pulls a 4 MiB file from A through a loopback

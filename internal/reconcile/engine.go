@@ -70,18 +70,29 @@ type peerState struct {
 // the peer that lacks the loser's bytes can fetch it — SR-7 "the copy syncs as a
 // normal file").
 //
-// preserve, if non-nil, is a conflict LOSER whose on-disk bytes MUST be copied to its
-// .sync-conflict path BEFORE leaf (the winner) touches the shared original path. The
-// puller (runFetch) runs preserve-then-leaf as ONE unit: the destructive winner step
-// (overwrite a live winner, or remove the original for a winning tombstone) only
-// proceeds if the copy actually lands; otherwise the winner is SKIPPED so the loser's
-// only on-disk bytes survive for the next reconcile (SR-7). Coupling the two into ONE
-// queue slot also makes a queue-full drop atomic — both or neither — closing the
-// split-drop data-loss hole (PR-3, decisions/phase7/PR-3-conflict-no-data-loss-ordering).
+// preserve, if non-nil, is a leaf whose on-disk bytes MUST be materialised BEFORE leaf
+// (the destructive step) is applied. The puller (runFetch) runs preserve-then-leaf as
+// ONE unit: the destructive leaf step (overwrite a live winner, or remove the original
+// for a tombstone leaf) only proceeds if the preserve copy actually lands; otherwise the
+// leaf is SKIPPED so the bytes that were about to be destroyed survive for the next
+// reconcile. Coupling the two into ONE queue slot also makes a queue-full drop atomic —
+// both or neither — closing the split-drop data-loss hole. Two callers use it:
+//   - enqueueConflict (PR-3): preserve = the conflict LOSER's .sync-conflict copy,
+//     leaf = the winner install; preserveAdvertise=true (the minted copy is a new path
+//     the peer may lack — SR-7).
+//   - enqueueRename (PR-5): preserve = the rename's NEW create (which reuses the still-
+//     present OLD bytes via localSource — zero network), leaf = the OLD path's tombstone;
+//     preserveAdvertise=false (the create is a RECEIVED file, never re-broadcast —
+//     SR-6/SR-8/PR-6). Deferring the tombstone's os.Remove until after the create's copy
+//     lands makes the rename zero-network optimisation ORDER-INDEPENDENT
+//     (decisions/phase7/PR-5-rename-zero-network-order-independence).
+//
+// preserveAdvertise is whether the preserve step broadcasts its leaf on success.
 type fetchTask struct {
-	leaf      merkle.FileInfo
-	advertise bool
-	preserve  *merkle.FileInfo
+	leaf              merkle.FileInfo
+	advertise         bool
+	preserve          *merkle.FileInfo
+	preserveAdvertise bool
 }
 
 // completion is the puller's report back to the loop after a materialisation attempt.
@@ -699,6 +710,22 @@ func (e *Engine) reconcileWithPeer(ps *peerState) {
 		e.logf("reconcile: build trees: local=%v peer=%v", err1, err2)
 		return
 	}
+
+	// Resolve every differing path, bucketing the two halves of a possible rename so they
+	// can be COUPLED (PR-5). merkle.Diff emits in path-sorted order, NOT creates-before-
+	// deletes, and a tombstone install's os.Remove is synchronous while a create install is
+	// an async puller fetch — so without pairing a rename's OLD file is removed from disk
+	// before the create can reuse it, forcing a needless network fetch (the refuted "zero
+	// network" claim). Pairing a create with a same-content tombstone whose old bytes are
+	// still local lets the puller reuse them BEFORE the deferred removal — order-independent
+	// (decisions/phase7/PR-5-rename-zero-network-order-independence).
+	type tombInstall struct {
+		plan    plan
+		oldHash [32]byte // the receiver's CURRENT on-disk content at the old path (d.Local)
+		hasOld  bool     // the receiver actually holds those bytes locally ⇒ reusable
+	}
+	var creates []plan
+	var tombs []tombInstall
 	for _, d := range merkle.Diff(localTree, peerTree) {
 		// A file-vs-directory type clash is structurally irreconcilable at one path
 		// without choosing a loser: refuse + flag (no data lost, no impossible install,
@@ -707,8 +734,65 @@ func (e *Engine) reconcileWithPeer(ps *peerState) {
 			e.flagTypeClash(d)
 			continue
 		}
-		e.execute(ps, resolve(d.Local, d.Remote, e.selfShort))
+		p := resolve(d.Local, d.Remote, e.selfShort)
+		switch {
+		case p.kind == planInstall && !p.install.Deleted:
+			creates = append(creates, p)
+		case p.kind == planInstall && p.install.Deleted:
+			ti := tombInstall{plan: p}
+			// d.Local is the receiver's live leaf at the old path being deleted — its bytes
+			// are the rename source the create can reuse (the tombstone itself carries no
+			// content_hash; SetDeleted zeroes it).
+			if d.Local != nil && !d.Local.Deleted && d.Local.Type == merkle.TypeFile {
+				ti.oldHash = d.Local.ContentHash
+				ti.hasOld = true
+			}
+			tombs = append(tombs, ti)
+		default:
+			e.execute(ps, p) // conflict / no-op — unchanged
+		}
 	}
+
+	// Pair each create with a same-content tombstone whose old bytes are still local and
+	// enqueue the coupled rename task; skip any path already inflight (a concurrent task or
+	// the deferral window). Each tombstone matches at most one create. Coupling never drops
+	// or suppresses either half — it only reorders execution and sources the create's bytes
+	// locally — so even a content-hash false match (two unrelated identical files) reaches
+	// the identical converged end-state with no data loss.
+	tombPaired := make([]bool, len(tombs))
+	createDone := make([]bool, len(creates))
+	for ci := range creates {
+		if ps.inflight[creates[ci].install.Path] {
+			createDone[ci] = true // already in flight ⇒ do not re-enqueue standalone below
+			continue
+		}
+		for ti := range tombs {
+			if tombPaired[ti] || !tombs[ti].hasOld || ps.inflight[tombs[ti].plan.install.Path] {
+				continue
+			}
+			if tombs[ti].oldHash == creates[ci].install.ContentHash {
+				e.enqueueRename(ps, creates[ci].install, tombs[ti].plan.install)
+				tombPaired[ti] = true
+				createDone[ci] = true
+				break
+			}
+		}
+	}
+
+	// Execute the unpaired halves normally. A tombstone whose path is inflight (its coupled
+	// rename is mid-apply, deferring the os.Remove) is skipped — the coupled task owns its
+	// application; clearing inflight on completion lets a later reconcile finish any retry.
+	for ci := range creates {
+		if !createDone[ci] {
+			e.execute(ps, creates[ci])
+		}
+	}
+	for ti := range tombs {
+		if !tombPaired[ti] && !ps.inflight[tombs[ti].plan.install.Path] {
+			e.execute(ps, tombs[ti].plan)
+		}
+	}
+
 	e.mu.Lock()
 	if e.gcTombstonesLocked() {
 		e.rebuildLocked()
@@ -829,11 +913,40 @@ func (e *Engine) enqueueConflict(ps *peerState, loser, winner merkle.FileInfo) {
 	}
 	l := loser
 	select {
-	case ps.fetchQ <- fetchTask{leaf: winner, advertise: false, preserve: &l}:
+	case ps.fetchQ <- fetchTask{leaf: winner, advertise: false, preserve: &l, preserveAdvertise: true}:
 		ps.inflight[winner.Path] = true
 	default:
 		// queue full; the WHOLE coupled task is dropped atomically — the loser's bytes
 		// stay at the original path, the diff persists, a later reconcile retries (SR-7).
+	}
+}
+
+// enqueueRename couples a rename's two halves so the new path's content-addressed local
+// reuse is ORDER-INDEPENDENT (PR-5). The peer renamed old->new (same content_hash); the
+// receiver must create `newCreate` and tombstone `oldTomb`, and the new path's bytes are
+// still on disk ONLY at the old path. Enqueued as ONE coupled task (preserve=newCreate,
+// leaf=oldTomb), the puller materialises newCreate FIRST — localSource finds the OLD file
+// (still live in e.files + on disk, because the tombstone's destructive os.Remove is
+// deferred to the applyTomb completion that runs AFTER the copy) — so the create costs
+// ZERO network regardless of whether new sorts before or after old in the path-sorted
+// diff. preserveAdvertise=false: the create is a RECEIVED file, never re-broadcast
+// (SR-6/SR-8/PR-6). BOTH paths are marked inflight: newCreate so a duplicate reconcile
+// does not double-fetch it, oldTomb so a reconcile during the deferral window does not
+// separately apply the still-live old tombstone (reconcileWithPeer skips inflight tombs).
+// A queue-full drop is atomic (both or neither): the old bytes stay at the old path and a
+// later reconcile/rescan retries — no data loss.
+func (e *Engine) enqueueRename(ps *peerState, newCreate, oldTomb merkle.FileInfo) {
+	if ps.inflight[newCreate.Path] || ps.inflight[oldTomb.Path] {
+		return
+	}
+	c := newCreate
+	select {
+	case ps.fetchQ <- fetchTask{leaf: oldTomb, preserve: &c, preserveAdvertise: false}:
+		ps.inflight[newCreate.Path] = true
+		ps.inflight[oldTomb.Path] = true
+	default:
+		// queue full; the coupled rename is dropped atomically — the old file stays live
+		// on disk at the old path, the diff persists, a later reconcile retries.
 	}
 }
 
@@ -876,17 +989,19 @@ func (e *Engine) pullLoop(ctx context.Context, ps *peerState) {
 }
 
 // runFetch executes one (possibly coupled) puller task. A plain task just materialises
-// leaf. A COUPLED conflict task (preserve != nil) PRESERVES the loser's bytes FIRST —
-// copying them to the loser's .sync-conflict path (local-reuse from the still-present
-// original) — and only if that copy LANDS does it perform the winner's destructive
-// install: a live winner overwrites the path (materialise); a winning tombstone is
-// removed on the loop AFTER the copy (a deferred applyTomb completion). If the copy does
-// NOT land, the winner is SKIPPED (conflictAbort) so the loser's only on-disk bytes
-// survive untouched for a rescan-paced retry — the enforced copy-before-destroy that
-// makes SR-7 hold under saturation and for the delete-vs-modify case (PR-3 (A)+(B)).
+// leaf. A COUPLED task (preserve != nil) materialises the preserve leaf FIRST and only if
+// that lands does it perform leaf's destructive step: a live winner overwrites the path
+// (materialise); a tombstone leaf is removed on the loop AFTER the copy (a deferred
+// applyTomb completion). If the preserve copy does NOT land, leaf is SKIPPED
+// (conflictAbort) so the bytes about to be destroyed survive untouched for a rescan-paced
+// retry — the enforced copy-before-destroy. This serves BOTH the conflict loser-copy
+// (PR-3 (A)+(B)) and the rename create-before-old-removal (PR-5): for a rename, preserve
+// is the NEW create (reusing the OLD bytes still on disk — zero network) and leaf is the
+// OLD tombstone, so the create's local reuse ALWAYS precedes the old's removal regardless
+// of lexicographic order (order-independent zero-network rename).
 func (e *Engine) runFetch(ctx context.Context, ps *peerState, task fetchTask) {
 	if task.preserve != nil {
-		if !e.materialise(ctx, ps, *task.preserve, true) {
+		if !e.materialise(ctx, ps, *task.preserve, task.preserveAdvertise) {
 			// The loser copy did not land (queue/disk/declined). Do NOT touch the shared
 			// path. Clear the winner's inflight without re-driving an immediate reconcile;
 			// the loser's bytes remain intact at the path for the next rescan to retry.

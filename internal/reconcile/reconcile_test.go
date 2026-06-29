@@ -790,8 +790,14 @@ func TestApply_IdempotentRedelivery(t *testing.T) {
 	}
 }
 
-// ---------- WS-4 #8: rename = zero network transfer via local content-addressed reuse ----------
+// ---------- WS-4 #8 / PR-5: rename = zero network transfer via local content-addressed reuse ----------
 
+// TestRename_NoNetworkTransfer proves the localSource dedup unit IN ISOLATION: given a
+// live source file on disk, materialising the same content at a new path reuses it with
+// zero network REQUEST. It deliberately keeps the source alive and does NOT apply any
+// tombstone, so it does NOT prove a real cross-peer rename is zero-network — that is the
+// job of TestRename_CrossPeer_ZeroNetwork_OrderIndependent below, which drives the receiver
+// apply path where the old file is being deleted concurrently (PR-5 skeptic refutation).
 func TestRename_NoNetworkTransfer(t *testing.T) {
 	e := tempEngine(t)
 	fc := newFakeConn(0x40)
@@ -822,6 +828,88 @@ func TestRename_NoNetworkTransfer(t *testing.T) {
 	osNew := pathnorm.ToOSPath(e.absRoot, "new.txt", pathnorm.HostTarget())
 	if got, _ := os.ReadFile(osNew); string(got) != "the-payload-bytes" {
 		t.Fatalf("new path content = %q", got)
+	}
+}
+
+// TestRename_CrossPeer_ZeroNetwork_OrderIndependent is the PR-5 fix proof (Phase 7,
+// skeptic #1 obligation #1 / skeptic #2 obligations 1+2). It drives the REAL receiver
+// path — onIndexUpdate -> reconcileWithPeer -> merkle.Diff (path-sorted) -> rename pairing
+// -> coupled puller task -> materialise -> localSource — for a genuine cross-peer rename
+// where the OLD file is being TOMBSTONED concurrently with the NEW create. It asserts the
+// receiver issues ZERO network REQUEST regardless of whether the new path sorts before or
+// after the old in the diff (the pre-fix code removed the old file synchronously before the
+// async create could reuse it, deterministically forcing a fetch for new-sorts-after-old).
+// fc.count(MsgRequest) is the exact "0 REQUEST for that content_hash" obligation, observed
+// where REQUEST frames are visible (engine output, before TLS). Windows-hostile keys are
+// folded in (reserved device stems, escaped on a Windows target — paths are involved).
+func TestRename_CrossPeer_ZeroNetwork_OrderIndependent(t *testing.T) {
+	const payload = "the-rename-payload-every-byte-served-locally"
+	cases := []struct {
+		name, oldKey, newKey string
+	}{
+		{"new sorts AFTER old (deterministic pre-fix miss)", "a.txt", "z.txt"},
+		{"new sorts BEFORE old (pre-fix race)", "z.txt", "a.txt"},
+		// Windows-hostile keys: reserved device stems (escaped on a Windows target,
+		// written literally on the Unix test host). "dir/con.dat" sorts AFTER "dir/aux.dat".
+		{"windows-hostile reserved stems", "dir/aux.dat", "dir/con.dat"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := tempEngine(t)
+			e.requestTimeout = 100 * time.Millisecond // a regression fails FAST (no 2s wire wait)
+			fc := newFakeConn(0x50)
+			ps := e.registerFakePeer(fc)
+
+			// Pre-rename converged baseline: the receiver holds the OLD file (live on disk +
+			// recorded), and the peer's index reflects the same converged state.
+			writeFile(t, e, tc.oldKey, payload)
+			oldLive := liveFI(tc.oldKey, payload, 1, vv(2, 1)) // peer (short 2) authored it
+			e.mu.Lock()
+			e.files[tc.oldKey] = oldLive
+			e.rebuildLocked()
+			e.mu.Unlock()
+			ps.index[tc.oldKey] = oldLive
+
+			// The peer renames old->new: it broadcasts create(new)+delete(old) bumped on its
+			// own counter, ordered creates-before-deletes exactly as broadcastUpdate would.
+			newLeaf := liveFI(tc.newKey, payload, 2, vv(2, 2)) // content unchanged by the rename
+			oldTomb := oldLive.SetDeleted(2)                   // peer's tombstone for old ({2:2})
+			delta := []merkle.FileInfo{newLeaf, oldTomb}
+			orderCreatesBeforeDeletes(delta)
+			body, err := merkle.EncodeFileInfos(delta)
+			if err != nil {
+				t.Fatalf("encode delta: %v", err)
+			}
+
+			// Deliver via the real receiver entry point, then drain the puller + completions.
+			e.onIndexUpdate(ps, body)
+			pump(t, e, ps)
+
+			// 1. ZERO network: the new path was satisfied by local reuse of the still-present
+			//    old bytes — independent of the lexicographic order of old/new (PR-5 fix).
+			if n := fc.count(protocol.MsgRequest); n != 0 {
+				t.Fatalf("cross-peer rename issued %d network REQUEST(s), want 0 (order-independent local reuse)", n)
+			}
+			// 2. The new path holds the payload; the old path is gone on disk (removed AFTER
+			//    the copy landed — the deferred tombstone os.Remove).
+			if got, _ := os.ReadFile(pathnorm.ToOSPath(e.absRoot, tc.newKey, pathnorm.HostTarget())); string(got) != payload {
+				t.Fatalf("new path %q content = %q, want %q", tc.newKey, got, payload)
+			}
+			if _, statErr := os.Stat(pathnorm.ToOSPath(e.absRoot, tc.oldKey, pathnorm.HostTarget())); !os.IsNotExist(statErr) {
+				t.Fatalf("old path %q still on disk after rename (stat err=%v)", tc.oldKey, statErr)
+			}
+			// 3. Recorded state converged: new is live with the payload; old is no longer
+			//    live (its tombstone was applied, then ack-gated GC'd because the peer's index
+			//    already advertises the same tombstone — the correct steady state).
+			e.mu.RLock()
+			defer e.mu.RUnlock()
+			if fi, ok := e.files[tc.newKey]; !ok || fi.Deleted || fi.ContentHash != merkle.HashBytes([]byte(payload)) {
+				t.Fatalf("new path not recorded live with payload: %+v ok=%v", fi, ok)
+			}
+			if fi, ok := e.files[tc.oldKey]; ok && !fi.Deleted {
+				t.Fatalf("old path still recorded LIVE after rename (must be tombstoned or GC'd): %+v", fi)
+			}
+		})
 	}
 }
 
