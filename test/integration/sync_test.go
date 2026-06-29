@@ -118,6 +118,148 @@ func TestDeletion_NoResurrection(t *testing.T) {
 	}
 }
 
+// MK-6 / R-5 named acceptance test (deletion-across-restart): create+sync on A and B,
+// STOP A, delete the file on A's disk WHILE A IS DOWN, RESTART A. A's live watcher/rescan
+// never observed the delete — only the startup snapshot diff (SynthesizeDeletions) can
+// recover it. On reconnect the synthesized tombstone propagates: B removes its copy and
+// the file is NOT resurrected on A. This is the cross-peer, cross-restart behaviour the
+// unit tests (SynthesizeDeletions/restoreVVs/snapshot round-trip) cannot prove on their
+// own (skeptic #1 §1 / skeptic #3 §1).
+func TestRestart_SynthesizesDeletionFromSnapshot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	write(t, dirA, "doomed.txt", "data")
+	write(t, dirB, "doomed.txt", "data") // B independently holds the same file
+
+	a := startNode(t, ctx, dirA)
+	b := startNode(t, ctx, dirB)
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+	if _, ok := read(t, a.dir, "doomed.txt"); !ok {
+		t.Fatal("precondition: A should hold doomed.txt before stop (so its snapshot has it)")
+	}
+
+	// Stop A (shutdown persists the snapshot containing doomed.txt), then delete on disk.
+	stop(t, a)
+	if err := os.Remove(filepath.Join(dirA, "doomed.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart over the SAME folder + identity + snapshot ⇒ startupReconcile diffs the
+	// snapshot (has doomed.txt) against the scan (absent) and synthesizes the tombstone.
+	a = restartNode(t, ctx, a)
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+
+	if _, ok := read(t, a.dir, "doomed.txt"); ok {
+		t.Fatal("file resurrected on the restarted deleter A")
+	}
+	if _, ok := read(t, b.dir, "doomed.txt"); ok {
+		t.Fatal("stale peer B did not apply the deletion synthesized from A's snapshot")
+	}
+}
+
+// MK-6 recreate-over-tombstone across a restart (skeptic #1 §2): A's persisted snapshot
+// holds a tombstone for a path, the file is RECREATED on A's disk while A is down, then A
+// restarts. The recreate must come back with a version vector that DOMINATES the persisted
+// tombstone, so a peer still holding a tombstone ADOPTS the recreate instead of re-deleting
+// it. Under the pre-fix code the recreate kept an empty VV and was DominatedBy the peer's
+// tombstone ⇒ silently re-deleted (loss of the local re-creation).
+//
+// To make the precondition deterministic we delete the file INDEPENDENTLY on each node
+// while they are DISCONNECTED: with no peer, neither node GCs its tombstone (the ack-gated
+// GC retains when no peer is known), so A's snapshot truly retains its tombstone and B
+// holds a concurrent tombstone whose non-empty VV would dominate an empty-VV recreate. (A
+// delete performed while connected would be GC'd off both sides once acked, collapsing the
+// case to a cold-start reseed and NOT exercising restoreVVs.)
+func TestRestart_RecreateOverTombstoneSurvives(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	write(t, dirA, "doomed.txt", "v1")
+	write(t, dirB, "doomed.txt", "v1")
+
+	a := startNode(t, ctx, dirA)
+	b := startNode(t, ctx, dirB) // started but never connected to a until the end
+
+	aWithFile, bWithFile := a.eng.RootHash(), b.eng.RootHash()
+	if err := os.Remove(filepath.Join(dirA, "doomed.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dirB, "doomed.txt")); err != nil {
+		t.Fatal(err)
+	}
+	waitRootChanged(t, a, aWithFile, budgetAuthor) // A authors + retains its tombstone (no peer ⇒ no GC)
+	waitRootChanged(t, b, bWithFile, budgetAuthor) // B authors + retains a concurrent tombstone
+
+	// Stop A (snapshot now holds A's tombstone), recreate the file on A's disk WHILE DOWN,
+	// then restart.
+	stop(t, a)
+	const recreated = "recreated-while-down"
+	if err := os.WriteFile(filepath.Join(dirA, "doomed.txt"), []byte(recreated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a = restartNode(t, ctx, a)
+
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+
+	// The recreate must survive on BOTH peers — as the live file, or (if the concurrent
+	// tombstone happens to win the mtime tiebreak) as a .sync-conflict copy. It must NOT be
+	// silently re-deleted. hasContentSomewhere is robust to which side wins the tiebreak.
+	for name, n := range map[string]*node{"A": a, "B": b} {
+		if !hasContentSomewhere(t, n.dir, recreated) {
+			t.Fatalf("node %s: recreate %q was re-deleted across the restart (data loss)", name, recreated)
+		}
+	}
+}
+
+// MK-6 delete-while-down vs a concurrent remote edit (skeptic #3 §3): A deletes a file
+// while down; concurrently B edits the SAME file. A's synthesized tombstone is Concurrent
+// with B's edited version (a delete-vs-edit conflict). The data-loss-free outcome is
+// modify-beats-delete (Syncthing-style): B's edited bytes must survive on BOTH peers —
+// as the live file when the edit wins, or as a .sync-conflict copy when a stale tombstone
+// mtime wins (the byte-holder mints the copy). The assertion checks the bytes are present
+// SOMEWHERE on both peers, so it is immune to the conflict-winner mtime/ShortID ordering.
+func TestRestart_DeleteWhileDownVsRemoteEdit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	write(t, dirA, "f.txt", "v1")
+	write(t, dirB, "f.txt", "v1")
+
+	a := startNode(t, ctx, dirA)
+	b := startNode(t, ctx, dirB)
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+
+	// Stop A, then CONCURRENTLY: delete f.txt on A's disk (recovered via the snapshot diff
+	// at restart) and edit f.txt on the still-running B (a genuine concurrent authorship).
+	stop(t, a)
+	if err := os.Remove(filepath.Join(dirA, "f.txt")); err != nil {
+		t.Fatal(err)
+	}
+	const edited = "v2-from-B"
+	bBefore := b.eng.RootHash()
+	write(t, b.dir, "f.txt", edited)
+	waitRootChanged(t, b, bBefore, budgetAuthor) // B authored its edit while A was down
+
+	a = restartNode(t, ctx, a)
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+
+	// No data loss: B's edited bytes are recoverable on BOTH peers (live file or copy).
+	for name, n := range map[string]*node{"A": a, "B": b} {
+		if !hasContentSomewhere(t, n.dir, edited) {
+			t.Fatalf("node %s lost B's concurrent edit %q across the delete-while-down conflict", name, edited)
+		}
+	}
+}
+
 // WS-4 #11: two instances doing simultaneous large transfers in BOTH directions
 // converge within a timeout — a hang would be the back-pressure deadlock. Stop-and-
 // wait pull bounds the outbound queue so neither side wedges (CDD-1).

@@ -895,6 +895,39 @@ func TestRestoreVVs(t *testing.T) {
 	}
 }
 
+// TestRestoreVVs_RecreateOverTombstoneDominates — MK-6 (skeptic #1 §2): a path whose
+// snapshot entry is a TOMBSTONE but which is present on disk again (recreated while the
+// daemon was down) must come back with a VV that DOMINATES the tombstone, exactly as a
+// live recreate would (onLocalChange/rescan bump prev.Version). Otherwise the recreate
+// keeps an empty VV and a peer still holding the tombstone re-deletes it (data loss).
+func TestRestoreVVs_RecreateOverTombstoneDominates(t *testing.T) {
+	self := protocol.ShortID(5)
+	tomb := tombFI("doc.txt", 1, vv(9, 3)) // deleted earlier (peer 9 authored the delete), VV {9:3}
+	prev := []merkle.FileInfo{tomb}
+	cur := []merkle.FileInfo{liveFI("doc.txt", "recreated", 2, nil)} // back on disk, scan VV empty
+
+	out := restoreVVs(prev, cur, self)
+	if len(out) != 1 {
+		t.Fatalf("expected just the recreated file, got %d", len(out))
+	}
+	got := out[0]
+	if got.Deleted {
+		t.Fatalf("recreated path must be live, not a tombstone")
+	}
+	// The recreate must strictly dominate the tombstone's VV, so a peer holding the
+	// tombstone adopts the recreate instead of re-deleting it.
+	if ord := got.Version.Compare(tomb.Version); ord != protocol.Dominates {
+		t.Fatalf("recreate VV %v must Dominate tombstone VV %v, got %v", got.Version, tomb.Version, ord)
+	}
+	if got.Version.Get(self) == 0 {
+		t.Fatalf("recreate must carry a self-authored bump, got VV %v", got.Version)
+	}
+	// Mirrors the live recreate path exactly: prev.Version.Bump(self).
+	if want := tomb.Version.Bump(self); !got.Version.IsEqual(want) {
+		t.Fatalf("recreate VV = %v, want tombstone.Bump(self) = %v", got.Version, want)
+	}
+}
+
 func TestDropFromVV(t *testing.T) {
 	in := vv(1, 3, 2, 5, 3, 7)
 	out := dropFromVV(in, 2)

@@ -34,14 +34,18 @@ const (
 	budgetLarge    = 60 * time.Second // multi-MiB transfers under load
 )
 
-// node is one in-process engine + its transport, listening on a loopback port.
+// node is one in-process engine + its transport, listening on a loopback port. id and
+// snapPath are retained so a node can be STOPPED and RESTARTED over the same folder,
+// device identity, and snapshot file (the MK-6 deletion-across-restart scenarios).
 type node struct {
-	dir  string
-	id   *transport.Identity
-	tp   *transport.Transport
-	eng  *reconcile.Engine
-	addr string
-	done chan struct{}
+	dir      string
+	id       *transport.Identity
+	tp       *transport.Transport
+	eng      *reconcile.Engine
+	addr     string
+	done     chan struct{}
+	cancel   context.CancelFunc
+	snapPath string
 }
 
 // nodeOpt tweaks a node's reconcile.Config before construction (used by the large-file
@@ -69,17 +73,39 @@ func startNode(t *testing.T, ctx context.Context, syncDir string, opts ...nodeOp
 	if err != nil {
 		t.Fatalf("identity: %v", err)
 	}
-	snapDir := t.TempDir()
+	snapPath := filepath.Join(t.TempDir(), "snapshot.gob")
+	return buildNode(t, ctx, syncDir, id, snapPath, opts...)
+}
+
+// restartNode simulates a daemon restart: it builds a FRESH engine + transport over the
+// SAME folder, device identity, and snapshot path as old. The caller MUST stop(old)
+// first (so old's shutdown has persisted the snapshot and freed its port). The restarted
+// node loads that snapshot and runs startupReconcile — the only path that can recover a
+// deletion/recreate that happened while the daemon was down (MK-6).
+func restartNode(t *testing.T, ctx context.Context, old *node, opts ...nodeOpt) *node {
+	t.Helper()
+	return buildNode(t, ctx, old.dir, old.id, old.snapPath, opts...)
+}
+
+// buildNode is the shared constructor for startNode/restartNode. The transport is tied
+// to the node's OWN cancellable child context, so stop(n) tears down the transport (and
+// frees its loopback port) as well as the engine — a clean, restartable teardown.
+func buildNode(t *testing.T, ctx context.Context, syncDir string, id *transport.Identity, snapPath string, opts ...nodeOpt) *node {
+	t.Helper()
+	// Each node owns its own cancellable child context so stop / cleanup reaps its Run
+	// + transport goroutines BEFORE the test object is torn down (otherwise the engine's
+	// t.Logf would race testing's teardown).
+	nctx, ncancel := context.WithCancel(ctx)
 
 	var eng *reconcile.Engine
-	tp := transport.New(ctx, id, transport.NewAllowlist(),
+	tp := transport.New(nctx, id, transport.NewAllowlist(),
 		transport.WithHello(func() protocol.Hello { return eng.Hello() }))
 
 	cfg := reconcile.Config{
 		FolderID:         "t",
 		AbsRoot:          syncDir,
 		Self:             id.DeviceID,
-		SnapshotPath:     filepath.Join(snapDir, "snapshot.gob"),
+		SnapshotPath:     snapPath,
 		Transport:        tp,
 		RescanInterval:   40 * time.Millisecond, // fast change-detection (watcher is disabled)
 		SnapshotInterval: time.Hour,
@@ -89,22 +115,30 @@ func startNode(t *testing.T, ctx context.Context, syncDir string, opts ...nodeOp
 	for _, o := range opts {
 		o(&cfg)
 	}
-	eng, err = reconcile.New(cfg)
+	eng, err := reconcile.New(cfg)
 	if err != nil {
+		ncancel()
 		t.Fatalf("engine: %v", err)
 	}
 	addr, err := tp.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		ncancel()
 		t.Fatalf("listen: %v", err)
 	}
-	// Each node owns its own cancellable child context so its Run goroutine is reaped
-	// at cleanup BEFORE the test object is torn down (otherwise the engine's t.Logf
-	// would race testing's teardown). Cleanup runs after the test body returns.
-	nctx, ncancel := context.WithCancel(ctx)
-	n := &node{dir: syncDir, id: id, tp: tp, eng: eng, addr: addr.String(), done: make(chan struct{})}
+	n := &node{dir: syncDir, id: id, tp: tp, eng: eng, addr: addr.String(), done: make(chan struct{}), cancel: ncancel, snapPath: snapPath}
 	go func() { _ = eng.Run(nctx); close(n.done) }()
 	t.Cleanup(func() { ncancel(); <-n.done })
 	return n
+}
+
+// stop cancels n's engine+transport context and waits for Run to return. Run's teardown
+// persists the snapshot (engine.go shutdown saveSnapshot), so after stop the snapshot on
+// disk reflects n's last state — what a restartNode then loads. Idempotent: the t.Cleanup
+// hook may cancel + wait again (a second cancel is a no-op; the closed done returns at once).
+func stop(t *testing.T, n *node) {
+	t.Helper()
+	n.cancel()
+	<-n.done
 }
 
 // connect pairs a and b (mutual allow-list) and dials a -> b. Dial blocks through the
@@ -193,6 +227,27 @@ func conflictCopies(t *testing.T, dir, parent string) []string {
 		}
 	}
 	return out
+}
+
+// hasContentSomewhere reports whether ANY regular file under dir (recursively) holds
+// exactly want — used to assert a conflict left the loser's bytes RECOVERABLE without
+// pinning which path won. The engine's own temp/probe artefacts (.msync-*) are skipped.
+// This makes the "no data loss" assertion robust to the conflict winner being either the
+// live path OR a .sync-conflict copy (the outcome depends on mtime/ShortID ordering).
+func hasContentSomewhere(t *testing.T, dir, want string) bool {
+	t.Helper()
+	found := false
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || strings.HasPrefix(d.Name(), ".msync-") {
+			return nil
+		}
+		b, rerr := os.ReadFile(p)
+		if rerr == nil && string(b) == want {
+			found = true
+		}
+		return nil
+	})
+	return found
 }
 
 // tempFiles lists the engine's atomic-write temp artefacts (.msync-*.tmp) left in dir.

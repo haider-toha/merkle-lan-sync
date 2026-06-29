@@ -228,8 +228,13 @@ func (e *Engine) startupReconcile() error {
 // restoreVVs re-attaches persisted version vectors to a fresh scan (whose VVs are
 // empty): an unchanged file keeps its history; a file whose content changed while the
 // daemon was down is a local authorship event (bump); a brand-new file keeps the empty
-// VV the initial scan seeds (CDD-3 — initial scan is not authorship). A reappeared path
-// over a prior tombstone is a new create (empty VV). Pure; testable.
+// VV the initial scan seeds (CDD-3 — initial scan is not authorship). A path whose
+// snapshot entry is a TOMBSTONE but which is present on disk again was RECREATED while
+// the daemon was down: its VV is bumped ON TOP of the tombstone's so the recreate
+// DOMINATES the prior delete — identical to the two live recreate paths (onLocalChange,
+// rescan: prev.Version.Bump(self)). Without this, the recreate would keep an empty VV
+// and a peer still holding the tombstone (non-empty VV) would dominate it and re-delete
+// the local re-creation — the MK-6 recreate-over-tombstone data-loss case. Pure; testable.
 func restoreVVs(prev, cur []merkle.FileInfo, self protocol.ShortID) []merkle.FileInfo {
 	if len(prev) == 0 {
 		return cur
@@ -242,7 +247,13 @@ func restoreVVs(prev, cur []merkle.FileInfo, self protocol.ShortID) []merkle.Fil
 	copy(out, cur)
 	for i := range out {
 		p, ok := byPath[out[i].Path]
-		if !ok || p.Deleted {
+		if !ok {
+			continue // brand-new file: keep the empty VV the scan seeds (CDD-3)
+		}
+		if p.Deleted {
+			// Recreated over a snapshot tombstone while down: bump so it dominates the
+			// delete it supersedes (SynthesizeDeletions keeps this present cur entry).
+			out[i].Version = p.Version.Bump(self)
 			continue
 		}
 		if p.ContentHash == out[i].ContentHash && p.Type == out[i].Type {
