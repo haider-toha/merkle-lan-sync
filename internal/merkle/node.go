@@ -47,28 +47,48 @@ func dirHash(children []childEntry) [32]byte {
 	return out
 }
 
-// rehash computes this node's structural hash bottom-up: a leaf hashes its
-// leafEncoding under the leaf domain byte; a directory sorts its children ascending
-// by bytewise name compare, recurses, and hashes the (name, childHash) list under
-// the node domain byte. Because a node's hash depends only on its DIRECT children,
-// a single leaf change re-hashes exactly its root->leaf path; every off-path
-// sibling hash is reused verbatim (MK-1 §D.4, WS-1 criterion 3).
+// rehash recomputes this node's structural hash bottom-up over the WHOLE subtree it
+// is called on: a leaf hashes its leafEncoding under the leaf domain byte; a
+// directory recurses into EVERY child and then hashes the name-sorted
+// (name, childHash) list (hashFromChildren) under the node domain byte. BuildTree
+// calls it once on the root, so a full build is O(n) — every node is (re)hashed.
+//
+// This is NOT the incremental rebuild: the O(depth) "re-hash only a changed leaf's
+// root->leaf path, reuse every off-path sibling hash verbatim" recompute MK-1
+// describes is Tree.Update (tree.go), which shares hashFromChildren so both paths
+// produce byte-identical hashes. What rehash gives is the DETERMINISM behind WS-1
+// criterion 3's OUTPUT property: a node's hash depends only on its direct children,
+// so a one-byte change yields a hash difference confined to that leaf's branch —
+// asserted by TestOneByteChange_MinimalBranch (two independent full builds compared).
 func (n *Node) rehash() {
 	if !n.isDir {
 		n.hash = leafHash(*n.leaf)
 		return
 	}
-	names := make([]string, 0, len(n.children))
-	for name := range n.children {
+	for _, c := range n.children {
+		c.rehash()
+	}
+	n.hash = hashFromChildren(n.children)
+}
+
+// hashFromChildren computes a directory node's structural hash from its children's
+// ALREADY-CACHED hashes (it does NOT recurse). It sorts children ascending by
+// bytewise name compare, then hashes the (name, childHash) list under the node domain
+// byte. It is the single shared directory-hash recipe used by BOTH the full rebuild
+// (rehash, after it has recursed) and the incremental copy-on-write rebuild
+// (Tree.Update / cowUpsert, which reuses every off-path child's cached hash verbatim)
+// — so the two paths are byte-for-byte equivalent by construction. Every child's hash
+// field must already be populated.
+func hashFromChildren(children map[string]*Node) [32]byte {
+	names := make([]string, 0, len(children))
+	for name := range children {
 		names = append(names, name)
 	}
 	sort.Slice(names, func(i, j int) bool { return names[i] < names[j] })
 
 	entries := make([]childEntry, len(names))
 	for i, name := range names {
-		c := n.children[name]
-		c.rehash()
-		entries[i] = childEntry{name: name, hash: c.hash}
+		entries[i] = childEntry{name: name, hash: children[name].hash}
 	}
-	n.hash = dirHash(entries)
+	return dirHash(entries)
 }

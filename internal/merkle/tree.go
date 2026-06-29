@@ -25,10 +25,10 @@ type Tree struct {
 func BuildTree(set []FileInfo) (*Tree, error) {
 	root := &Node{isDir: true, children: make(map[string]*Node)}
 	for _, fi := range set {
-		if fi.Path == "" {
-			return nil, fmt.Errorf("%w: empty path", ErrTreeConflict)
+		comps, err := splitPathComponents(fi.Path)
+		if err != nil {
+			return nil, err
 		}
-		comps := strings.Split(fi.Path, "/")
 		cur := root
 		for i, comp := range comps {
 			last := i == len(comps)-1
@@ -53,6 +53,107 @@ func BuildTree(set []FileInfo) (*Tree, error) {
 	}
 	root.rehash()
 	return &Tree{root: root}, nil
+}
+
+// splitPathComponents splits a canonical forward-slash key into its components,
+// rejecting a path the structural grammar cannot encode unambiguously: an empty path,
+// an empty component (e.g. "a//b" or a leading/trailing "/"), or a component whose
+// UTF-8 byte length exceeds the uint16 nameLen prefix nodeEncoding uses (codec.go) —
+// such a component would silently truncate and could collide with a different name.
+// The upstream canonicaliser is the primary guard; this is defense in depth at the
+// tree layer (MK-1 skeptic-3 #3/#4). Shared by BuildTree and Tree.Update so both
+// enforce identical path invariants.
+func splitPathComponents(path string) ([]string, error) {
+	if path == "" {
+		return nil, fmt.Errorf("%w: empty path", ErrTreeConflict)
+	}
+	comps := strings.Split(path, "/")
+	for _, c := range comps {
+		if c == "" {
+			return nil, fmt.Errorf("%w: empty path component in %q", ErrTreeConflict, path)
+		}
+		if len(c) > 0xFFFF {
+			return nil, fmt.Errorf("%w: path component (%d bytes) exceeds uint16 nameLen in %q", ErrTreeConflict, len(c), path)
+		}
+	}
+	return comps, nil
+}
+
+// Update returns a NEW tree equal to BuildTree(the current set with fi upserted at
+// fi.Path), but computed INCREMENTALLY: it re-hashes ONLY the directory nodes on
+// fi.Path's root->leaf chain (depth+1 SHA-256 computations) and shares every off-path
+// subtree with the receiver by pointer (copy-on-write). The receiver is NEVER mutated,
+// so the old snapshot stays valid and safe to read concurrently under the reconcile
+// RWMutex (GR-5, node.go:17-21). This is the O(depth) incremental rebuild MK-1
+// describes — a single leaf change reuses every off-path sibling hash verbatim instead
+// of the O(n) full BuildTree — and it shares hashFromChildren with rehash, so its
+// output is byte-for-byte identical to a full rebuild (proven by
+// TestUpdate_IncrementalEqualsFullBuild / TestUpdate_EquivalenceFuzz).
+//
+// fi is upserted as a leaf at fi.Path: it replaces an existing leaf there, or creates
+// it plus any missing intermediate directory nodes. It returns ErrTreeConflict on the
+// same path invariants BuildTree enforces — an empty path, an empty/oversized
+// component (splitPathComponents), a component that traverses an existing FILE, or a
+// final component already occupied by a DIRECTORY (file-vs-directory collision).
+//
+// Update does not remove nodes; a deletion is modelled as upserting a tombstone leaf
+// (FileInfo.SetDeleted), which Update handles as an ordinary same-path leaf replace.
+func (t *Tree) Update(fi FileInfo) (*Tree, error) {
+	comps, err := splitPathComponents(fi.Path)
+	if err != nil {
+		return nil, err
+	}
+	var oldRoot *Node
+	if t != nil {
+		oldRoot = t.root
+	}
+	if oldRoot == nil {
+		oldRoot = &Node{isDir: true, children: make(map[string]*Node)}
+	}
+	leaf := fi // own copy; the tree must not alias the caller's value
+	newRoot, err := cowUpsert(oldRoot, comps, &leaf)
+	if err != nil {
+		return nil, err
+	}
+	return &Tree{root: newRoot}, nil
+}
+
+// cowUpsert returns a copy-on-write clone of the directory node dir with leaf upserted
+// at comps (comps[0] is the next component under dir; comps is non-empty). Off-path
+// children are shared with dir by pointer — their cached hashes reused verbatim — and
+// only the clone plus the chain down to the leaf are freshly allocated and re-hashed
+// (via hashFromChildren, the same recipe rehash uses). dir is never mutated.
+func cowUpsert(dir *Node, comps []string, leaf *FileInfo) (*Node, error) {
+	if !dir.isDir {
+		return nil, fmt.Errorf("%w: %q traverses a file component", ErrTreeConflict, comps[0])
+	}
+	kids := make(map[string]*Node, len(dir.children)+1)
+	for name, c := range dir.children {
+		kids[name] = c // share off-path subtrees by pointer (copy-on-write)
+	}
+	clone := &Node{name: dir.name, isDir: true, children: kids}
+
+	head := comps[0]
+	if len(comps) == 1 {
+		if existing, ok := kids[head]; ok && existing.isDir {
+			return nil, fmt.Errorf("%w: %q is a directory, cannot place a leaf", ErrTreeConflict, head)
+		}
+		ln := &Node{name: head, isDir: false, leaf: leaf}
+		ln.hash = leafHash(*leaf)
+		kids[head] = ln
+	} else {
+		child, ok := kids[head]
+		if !ok {
+			child = &Node{name: head, isDir: true, children: make(map[string]*Node)}
+		}
+		newChild, err := cowUpsert(child, comps[1:], leaf)
+		if err != nil {
+			return nil, err
+		}
+		kids[head] = newChild
+	}
+	clone.hash = hashFromChildren(kids)
+	return clone, nil
 }
 
 // RootHash returns the tree's root structural hash. Two fully-converged peers hold
