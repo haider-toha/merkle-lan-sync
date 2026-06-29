@@ -86,6 +86,57 @@ func TestConflict_NeitherVersionLostSymmetricName(t *testing.T) {
 	}
 }
 
+// PR-3 (Phase 7, skeptic #2 §1): a concurrent delete-vs-modification where the DELETE
+// WINS the tiebreak must still preserve the losing modification as a .sync-conflict copy
+// on BOTH peers (SR-7/SR-9, finding §5) — no data loss. Delete-wins is forced
+// deterministically: a tombstone inherits the deleted file's mtime, so giving A's file a
+// FAR-FUTURE mtime before the delete makes A's tombstone beat B's now-stamped edit. The
+// loser-custodian (B) must copy its edit to the conflict path BEFORE the winning delete
+// removes it; pre-fix the synchronous tombstone os.Remove destroyed it first (the bug).
+func TestConflict_DeleteVsModify_NoLossBothPeers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	write(t, dirA, "f.txt", "v1")
+	write(t, dirB, "f.txt", "v1")
+
+	a := startNode(t, ctx, dirA)
+	b := startNode(t, ctx, dirB)
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+
+	// Far-future mtime on A's file; wait for A's rescan to record it (a quiet mtime-only
+	// update — no rebroadcast, so B stays at its own now-stamped version).
+	future := time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(filepath.Join(dirA, "f.txt"), future, future); err != nil {
+		t.Fatal(err)
+	}
+	waitRecordedMtimeAtLeast(t, a, "f.txt", time.Date(2199, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(), budgetAuthor)
+
+	// Stop A (snapshot now carries the future mtime), delete on A's disk while down, and
+	// CONCURRENTLY edit f.txt on the still-running B.
+	stop(t, a)
+	if err := os.Remove(filepath.Join(dirA, "f.txt")); err != nil {
+		t.Fatal(err)
+	}
+	const edited = "v2-from-B-the-losing-modification"
+	bBefore := b.eng.RootHash()
+	write(t, b.dir, "f.txt", edited)
+	waitRootChanged(t, b, bBefore, budgetAuthor)
+
+	a = restartNode(t, ctx, a) // startupReconcile synthesizes the future-dated tombstone
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+
+	// Delete won ⇒ the losing modification survives as a recoverable copy on BOTH peers.
+	for name, n := range map[string]*node{"A": a, "B": b} {
+		if !hasContentSomewhere(t, n.dir, edited) {
+			t.Fatalf("node %s LOST the losing modification %q (delete-wins must keep a conflict copy)", name, edited)
+		}
+	}
+}
+
 // WS-4 #6: a deletion propagates and a stale peer cannot resurrect it. B holds the
 // pre-delete file and never saw the delete; on reconnect the tombstone Dominates B's
 // stale version ⇒ B deletes locally and the file is NOT re-created on the deleter A.

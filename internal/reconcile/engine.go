@@ -69,18 +69,37 @@ type peerState struct {
 // conflict-copy task sets advertise so the loser broadcasts the copy on success (so
 // the peer that lacks the loser's bytes can fetch it — SR-7 "the copy syncs as a
 // normal file").
+//
+// preserve, if non-nil, is a conflict LOSER whose on-disk bytes MUST be copied to its
+// .sync-conflict path BEFORE leaf (the winner) touches the shared original path. The
+// puller (runFetch) runs preserve-then-leaf as ONE unit: the destructive winner step
+// (overwrite a live winner, or remove the original for a winning tombstone) only
+// proceeds if the copy actually lands; otherwise the winner is SKIPPED so the loser's
+// only on-disk bytes survive for the next reconcile (SR-7). Coupling the two into ONE
+// queue slot also makes a queue-full drop atomic — both or neither — closing the
+// split-drop data-loss hole (PR-3, decisions/phase7/PR-3-conflict-no-data-loss-ordering).
 type fetchTask struct {
 	leaf      merkle.FileInfo
 	advertise bool
+	preserve  *merkle.FileInfo
 }
 
 // completion is the puller's report back to the loop after a materialisation attempt.
+// applyTomb marks a coupled-conflict winner that is a TOMBSTONE: the loser copy has
+// already landed, so the loop now applies the winning deletion (removing the original
+// AFTER the copy — never before, the (B) delete-vs-modify fix). conflictAbort marks a
+// coupled task whose loser copy did NOT land: the winner was skipped to protect the
+// loser's bytes, so the loop just clears inflight WITHOUT an immediate re-reconcile (a
+// rescan-paced retry; an immediate one could tight-spin while e.files still shows the
+// loser live).
 type completion struct {
-	leaf      merkle.FileInfo
-	ok        bool
-	clobber   bool
-	advertise bool
-	peer      protocol.ShortID
+	leaf          merkle.FileInfo
+	ok            bool
+	clobber       bool
+	advertise     bool
+	applyTomb     bool
+	conflictAbort bool
+	peer          protocol.ShortID
 }
 
 // Config configures an Engine. Transport/Discovery/Watcher are optional (nil ⇒ that
@@ -672,11 +691,13 @@ func (e *Engine) reconcileWithPeer(ps *peerState) {
 	e.mu.Unlock()
 }
 
-// execute carries out a resolver plan. NoOp does nothing; a live install / conflict
-// is materialised by the per-peer puller (off the loop); a tombstone install / delete
-// is applied directly. For a conflict the loser copy is enqueued BEFORE the winner so
-// the loser's still-on-disk bytes are copied locally before the winner overwrites the
-// path (FIFO per-peer puller preserves the order).
+// execute carries out a resolver plan. NoOp does nothing; a live install is
+// materialised by the per-peer puller (off the loop); a tombstone install is applied
+// directly. For a conflict where THIS side holds the loser's bytes, the loser copy and
+// the winner's (destructive) install are enqueued as ONE coupled puller task so the
+// winner can never overwrite/remove the loser's only on-disk copy before that copy
+// lands — the SR-7 no-data-loss guarantee under queue saturation AND for a winning
+// tombstone (PR-3 (A)+(B); decisions/phase7/PR-3-conflict-no-data-loss-ordering.md).
 func (e *Engine) execute(ps *peerState, p plan) {
 	switch p.kind {
 	case planNoOp:
@@ -688,16 +709,26 @@ func (e *Engine) execute(ps *peerState, p plan) {
 			e.enqueueFetch(ps, p.install, false)
 		}
 	case planConflict:
-		// Only the side that ALREADY holds the loser's bytes materialises the copy
-		// (local-reuse, zero network) and advertises it; the other side simply fetches
-		// it as a normal remote file once that advertisement lands (a later reconcile),
-		// so there is no racy cross-fetch of a copy the source has not created yet.
-		if p.loser != nil && e.hasLocalContent(p.loser.ContentHash) {
-			e.enqueueFetch(ps, *p.loser, true)
-		}
-		if p.winner.Deleted {
+		switch {
+		case p.loser != nil && e.hasLocalContent(p.loser.ContentHash):
+			// This side holds the loser's bytes: it is the custodian that mints the copy.
+			// Refuse+flag (never destructive) if the conflict-copy key would exceed Windows
+			// MAX_PATH on an unconfirmed-long-path target — leaving BOTH versions at their
+			// paths (no data lost), the same carve-out as ErrCaseClobber / ErrTypeClash
+			// (PR-3 §6, maxpath-longpath). Otherwise enqueue the COUPLED copy-then-winner
+			// task: the puller preserves the loser before the winner touches the path.
+			if pathnorm.WouldExceedMaxPath(e.absRoot, p.loser.Path) {
+				e.logf("%v: conflict copy %q would exceed Windows MAX_PATH (%d) — refused (no data lost; resolve by hand)", ErrMaxPathExceeded, p.loser.Path, pathnorm.MaxPath)
+				return
+			}
+			e.enqueueConflict(ps, *p.loser, p.winner)
+		case p.winner.Deleted:
+			// Winner-custodian for a winning deletion (we lack the loser's bytes — they
+			// arrive as the advertised copy from the side that holds them): apply the delete.
 			e.applyTombstone(p.winner)
-		} else {
+		default:
+			// Winner-custodian for a live winner (or a losing tombstone, p.loser==nil):
+			// install the winner; any loser copy is fetched from its holder as a normal file.
 			e.enqueueFetch(ps, p.winner, false)
 		}
 	}
@@ -758,6 +789,29 @@ func (e *Engine) enqueueFetch(ps *peerState, leaf merkle.FileInfo, advertise boo
 	}
 }
 
+// enqueueConflict enqueues a COUPLED conflict task: preserve the loser's bytes as its
+// .sync-conflict copy (advertised so the peer that lacks them can fetch it — SR-7), then
+// install the winner at the shared path. Both ride ONE queue slot keyed on the winner
+// path, so (a) a queue-full drop is atomic — both or neither, the loser's bytes stay at
+// the original path for the next reconcile — and (b) the puller runs them in order,
+// gating the winner's destructive install on the copy actually landing (runFetch). This
+// is the enforced copy-before-destroy that the SR-7 no-data-loss contract requires under
+// saturation and for a winning tombstone (PR-3 (A)+(B)). A duplicate reconcile is
+// deduped while the winner path is in flight.
+func (e *Engine) enqueueConflict(ps *peerState, loser, winner merkle.FileInfo) {
+	if ps.inflight[winner.Path] {
+		return
+	}
+	l := loser
+	select {
+	case ps.fetchQ <- fetchTask{leaf: winner, advertise: false, preserve: &l}:
+		ps.inflight[winner.Path] = true
+	default:
+		// queue full; the WHOLE coupled task is dropped atomically — the loser's bytes
+		// stay at the original path, the diff persists, a later reconcile retries (SR-7).
+	}
+}
+
 // applyTombstone removes the on-disk file (off the lock) then records the tombstone
 // and its expected (zero) hash under the lock. On a real transition (we previously
 // held the file, or a different version) it RE-ADVERTISES the tombstone once: this
@@ -791,9 +845,37 @@ func (e *Engine) pullLoop(ctx context.Context, ps *peerState) {
 		case <-ps.conn.Done():
 			return
 		case task := <-ps.fetchQ:
-			e.materialise(ctx, ps, task.leaf, task.advertise)
+			e.runFetch(ctx, ps, task)
 		}
 	}
+}
+
+// runFetch executes one (possibly coupled) puller task. A plain task just materialises
+// leaf. A COUPLED conflict task (preserve != nil) PRESERVES the loser's bytes FIRST —
+// copying them to the loser's .sync-conflict path (local-reuse from the still-present
+// original) — and only if that copy LANDS does it perform the winner's destructive
+// install: a live winner overwrites the path (materialise); a winning tombstone is
+// removed on the loop AFTER the copy (a deferred applyTomb completion). If the copy does
+// NOT land, the winner is SKIPPED (conflictAbort) so the loser's only on-disk bytes
+// survive untouched for a rescan-paced retry — the enforced copy-before-destroy that
+// makes SR-7 hold under saturation and for the delete-vs-modify case (PR-3 (A)+(B)).
+func (e *Engine) runFetch(ctx context.Context, ps *peerState, task fetchTask) {
+	if task.preserve != nil {
+		if !e.materialise(ctx, ps, *task.preserve, true) {
+			// The loser copy did not land (queue/disk/declined). Do NOT touch the shared
+			// path. Clear the winner's inflight without re-driving an immediate reconcile;
+			// the loser's bytes remain intact at the path for the next rescan to retry.
+			e.report(completion{leaf: task.leaf, peer: ps.short, conflictAbort: true})
+			return
+		}
+		if task.leaf.Deleted {
+			// Winner is a tombstone (the delete won): the loser copy is safe ⇒ apply the
+			// winning deletion now, on the loop, AFTER the copy (never before — fix (B)).
+			e.report(completion{leaf: task.leaf, peer: ps.short, ok: true, applyTomb: true})
+			return
+		}
+	}
+	e.materialise(ctx, ps, task.leaf, task.advertise)
 }
 
 func (e *Engine) serveLoop(ctx context.Context, ps *peerState) {
@@ -824,6 +906,28 @@ func (e *Engine) report(c completion) {
 // apply is not local authorship, SR-6/SR-8), then re-reconciles with the source peer
 // to drain remaining diffs promptly.
 func (e *Engine) handleCompletion(c completion) {
+	if c.applyTomb {
+		// A coupled conflict whose winner is a TOMBSTONE: the loser copy already landed,
+		// so it is now safe to apply the winning deletion (remove the original, record the
+		// tombstone, GC-handshake broadcast). Deferred to here so the destructive remove
+		// NEVER precedes the copy (PR-3 (B)). applyTombstone is the same loop-side delete
+		// run for any tombstone; inflight was keyed on this path by the coupled enqueue.
+		e.applyTombstone(c.leaf)
+		e.clearInflight(c.peer, c.leaf.Path)
+		if ps := e.peerByShort(c.peer); ps != nil {
+			e.reconcileWithPeer(ps)
+		}
+		return
+	}
+	if c.conflictAbort {
+		// The loser copy did NOT land, so the winner step was skipped to protect the
+		// loser's bytes (still at the original path). Clear inflight so a LATER reconcile
+		// retries the coupled task; do not re-reconcile now — an immediate retry could
+		// tight-spin while e.files still records the loser as live (PR-3). The periodic
+		// rescan (source of truth, SR-11) re-drives it.
+		e.clearInflight(c.peer, c.leaf.Path)
+		return
+	}
 	if c.ok {
 		e.mu.Lock()
 		e.files[c.leaf.Path] = c.leaf

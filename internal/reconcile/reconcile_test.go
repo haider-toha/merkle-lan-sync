@@ -299,6 +299,292 @@ func TestConflict_CopyNameWindowsRoundTrips(t *testing.T) {
 	}
 }
 
+// ---------- PR-3 (Phase 7): conflict no-data-loss is ENFORCED in execution ----------
+
+// pump drives the engine single-threaded: it runs every queued fetch task through the
+// puller (runFetch) and every resulting completion through handleCompletion until both
+// the peer's fetch queue and the completion channel are drained, so a test can exercise
+// the real execute -> puller -> completion path deterministically without the concurrent
+// Run loop. A hard bound turns a regression that tight-spins into a clear failure.
+func pump(t *testing.T, e *Engine, ps *peerState) {
+	t.Helper()
+	for i := 0; i < 2000; i++ {
+		progressed := false
+		select {
+		case task := <-ps.fetchQ:
+			e.runFetch(context.Background(), ps, task)
+			progressed = true
+		default:
+		}
+		select {
+		case c := <-e.completions:
+			e.handleCompletion(c)
+			progressed = true
+		default:
+		}
+		if !progressed {
+			return
+		}
+	}
+	t.Fatalf("pump did not quiesce within bound (possible tight spin / data-loss retry storm)")
+}
+
+// hasContentInDir reports whether any non-internal regular file under dir (recursively)
+// holds exactly want — used to assert a conflict left the loser's bytes RECOVERABLE
+// without pinning the (timestamped) conflict-copy name.
+func hasContentInDir(t *testing.T, dir, want string) bool {
+	t.Helper()
+	found := false
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || strings.HasPrefix(d.Name(), internalPrefix) {
+			return nil
+		}
+		if b, rerr := os.ReadFile(p); rerr == nil && string(b) == want {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+func drainCompletions(e *Engine) []completion {
+	var out []completion
+	for {
+		select {
+		case c := <-e.completions:
+			out = append(out, c)
+		default:
+			return out
+		}
+	}
+}
+
+// TestResolver_DeleteWinsPreservesModification — the PURE resolver verdict for a
+// concurrent live-modification vs tombstone where the DELETE WINS (SR-9, finding §5):
+// planConflict whose winner is the tombstone and whose loser is the LIVE modification
+// minted as a .sync-conflict copy (so the engine can preserve it). Skeptic #2 §1 asked
+// for exactly this matrix coverage.
+func TestResolver_DeleteWinsPreservesModification(t *testing.T) {
+	mod := liveFI("f.txt", "edited", 1, vv(1, 1)) // live modification, LOW mtime
+	tomb := tombFI("f.txt", 100, vv(2, 1))        // deletion, HIGH mtime ⇒ delete wins
+	p := resolve(&mod, &tomb, 1)
+	if p.kind != planConflict {
+		t.Fatalf("delete-vs-modify must conflict (keep both), got %v", p.kind)
+	}
+	if !p.winner.Deleted {
+		t.Fatalf("with a higher tombstone mtime the DELETE must win the tiebreak; winner=%+v", p.winner)
+	}
+	if p.loser == nil || p.loser.Deleted {
+		t.Fatalf("the losing MODIFICATION must be preserved as a live conflict copy, loser=%v", p.loser)
+	}
+	if p.loser.ContentHash != merkle.HashBytes([]byte("edited")) {
+		t.Fatalf("conflict copy must carry the modification's bytes")
+	}
+	if !strings.Contains(p.loser.Path, ".sync-conflict-") {
+		t.Fatalf("loser must be routed to a .sync-conflict path, got %q", p.loser.Path)
+	}
+}
+
+// TestConflict_DeleteWins_ModificationPreservedAsCopy — the load-bearing PR-3 fix
+// (skeptic #2 §1): a concurrent live modification vs a WINNING tombstone must NOT lose
+// the modification. Pre-fix, execute enqueued the copy async but ran applyTombstone's
+// synchronous os.Remove FIRST, destroying the loser's only on-disk bytes before the copy
+// could read them (reproduced this session). Post-fix the copy is coupled BEFORE the
+// delete. Drives the real execute -> puller path and asserts the modification survives on
+// disk as a conflict copy. Windows-hostile path variants exercise the escaped on-disk name.
+func TestConflict_DeleteWins_ModificationPreservedAsCopy(t *testing.T) {
+	for _, key := range []string{"f.txt", "sub/CON.txt", "docs/résumé.txt"} {
+		t.Run(key, func(t *testing.T) {
+			e := tempEngine(t)
+			const mod = "the-modification-bytes-must-survive"
+			writeFile(t, e, key, mod)
+
+			local := liveFI(key, mod, 1, vv(1, 1)) // live modification, LOW mtime
+			e.mu.Lock()
+			e.files[key] = local
+			e.expected[key] = local.ContentHash
+			e.rebuildLocked()
+			e.mu.Unlock()
+
+			fc := newFakeConn(0x20)
+			ps := e.registerFakePeer(fc)
+			ps.index[key] = tombFI(key, 100, vv(2, 1)) // tombstone, HIGH mtime ⇒ delete wins
+
+			e.reconcileWithPeer(ps)
+			pump(t, e, ps)
+
+			// The deletion won ⇒ the original path is removed on disk (the winning delete
+			// was applied AFTER the copy, never before — the (B) fix).
+			osOrig := pathnorm.ToOSPath(e.absRoot, key, pathnorm.HostTarget())
+			if _, err := os.Stat(osOrig); !os.IsNotExist(err) {
+				t.Fatalf("original %q should be removed (delete won), stat err=%v", key, err)
+			}
+			// The losing MODIFICATION survives byte-for-byte as a .sync-conflict copy —
+			// the no-data-loss contract (SR-7/SR-9). (The applied tombstone itself may be
+			// ack-GC'd here since the peer advertised the identical one — that is correct
+			// convergence, not the property under test.)
+			if !hasContentInDir(t, e.absRoot, mod) {
+				t.Fatalf("losing modification was LOST — no on-disk copy holds it (SR-7/SR-9 violated)")
+			}
+			copies := conflictCopyNames(t, e.absRoot)
+			if len(copies) != 1 {
+				t.Fatalf("want exactly one .sync-conflict copy, got %v", copies)
+			}
+			e.mu.RLock()
+			defer e.mu.RUnlock()
+			// The modification is recorded as a live conflict-copy leaf, and the original
+			// key is NOT a live file (it is a tombstone or ack-GC'd — never resurrected).
+			if fi, ok := e.files[key]; ok && !fi.Deleted {
+				t.Fatalf("original key %q is unexpectedly live after a winning delete: %+v", key, fi)
+			}
+			liveCopy := false
+			for k, fi := range e.files {
+				if k != key && !fi.Deleted && fi.ContentHash == merkle.HashBytes([]byte(mod)) {
+					liveCopy = true
+				}
+			}
+			if !liveCopy {
+				t.Fatalf("no live conflict-copy leaf records the preserved modification")
+			}
+		})
+	}
+}
+
+// conflictCopyNames lists .sync-conflict-* basenames anywhere under dir (recursive).
+func conflictCopyNames(t *testing.T, dir string) []string {
+	t.Helper()
+	var out []string
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.Contains(d.Name(), ".sync-conflict-") {
+			out = append(out, d.Name())
+		}
+		return nil
+	})
+	return out
+}
+
+// TestConflict_WinnerGatedOnCopy_NoOverwriteWhenCopyFails — the core coupling guarantee
+// (skeptic #1/#3): the winner's destructive install must NOT proceed if the loser copy
+// fails to land. A coupled task whose preserve-copy fails (no local source, empty
+// network) must leave the shared path's original bytes untouched and report a
+// conflictAbort, never the winner.
+func TestConflict_WinnerGatedOnCopy_NoOverwriteWhenCopyFails(t *testing.T) {
+	e := tempEngine(t)
+	const original = "ORIGINAL-LOSER-BYTES-MUST-SURVIVE"
+	writeFile(t, e, "shared.txt", original)
+
+	// A source for the WINNER exists locally, so IF the gate regressed (winner installed)
+	// the original would be overwritten and the test would catch it.
+	writeFile(t, e, "winsrc.txt", "WINNER-BYTES")
+	e.mu.Lock()
+	e.files["winsrc.txt"] = liveFI("winsrc.txt", "WINNER-BYTES", 1, vv(1, 1))
+	e.mu.Unlock()
+
+	fc := newFakeConn(0x22)
+	ps := e.registerFakePeer(fc)
+
+	// preserve copy that cannot land: a hash with no local source + Size 0 (empty network
+	// read) ⇒ verify mismatch, fast deterministic failure (no timeout).
+	preserve := liveFI("shared.sync-conflict-x.txt", "phantom-loser", 1, vv(1, 1))
+	preserve.Size = 0
+	winner := liveFI("shared.txt", "WINNER-BYTES", 9, vv(2, 1))
+	ps.inflight["shared.txt"] = true // as if enqueued by enqueueConflict
+
+	e.runFetch(context.Background(), ps, fetchTask{leaf: winner, preserve: &preserve})
+
+	// The original (the loser's only on-disk bytes) is untouched: the winner was gated out.
+	if got, _ := os.ReadFile(pathnorm.ToOSPath(e.absRoot, "shared.txt", pathnorm.HostTarget())); string(got) != original {
+		t.Fatalf("winner overwrote the loser despite a failed copy: %q (data loss)", got)
+	}
+	// A conflictAbort was reported for the winner, and NO successful winner completion.
+	for _, c := range drainCompletions(e) {
+		if c.ok && c.leaf.Path == "shared.txt" {
+			t.Fatalf("winner was installed despite the copy failing: %+v", c)
+		}
+	}
+}
+
+// TestConflict_FullQueueDropsCoupledTaskAtomically — under fetchQ saturation the coupled
+// copy+winner task is dropped as ONE unit (both or neither), closing the split-drop hole
+// skeptic #1/#3 found (where the copy was dropped but the winner overwrite slipped
+// through). Neither enters the queue; the winner path is not marked in flight.
+func TestConflict_FullQueueDropsCoupledTaskAtomically(t *testing.T) {
+	e := tempEngine(t)
+	fc := newFakeConn(0x23)
+	ps := e.registerFakePeer(fc)
+
+	for i := 0; i < cap(ps.fetchQ); i++ { // saturate
+		ps.fetchQ <- fetchTask{}
+	}
+	loser := liveFI("f.sync-conflict-x.txt", "loser", 1, vv(1, 1))
+	winner := liveFI("f.txt", "winner", 9, vv(2, 1))
+
+	e.enqueueConflict(ps, loser, winner)
+
+	if n := len(ps.fetchQ); n != cap(ps.fetchQ) {
+		t.Fatalf("coupled task partially enqueued onto a full queue: len=%d cap=%d", n, cap(ps.fetchQ))
+	}
+	if ps.inflight["f.txt"] {
+		t.Fatalf("winner marked in flight despite the coupled task being dropped (split-drop hole)")
+	}
+}
+
+// TestConflict_RefusesOverMaxPathCopy — wires PR-3 §6 (skeptic #2 §2): a conflict whose
+// .sync-conflict copy key would exceed Windows MAX_PATH (260) is refused+flagged
+// (ErrMaxPathExceeded) and the loser is NOT overwritten — the same no-data-loss refuse
+// carve-out as case-clobber / type-clash. Exercised on the Mac via the explicit Windows
+// length in WouldExceedMaxPath.
+func TestConflict_RefusesOverMaxPathCopy(t *testing.T) {
+	e := tempEngine(t)
+	longKey := strings.Repeat("seg/", 70) + "file.txt" // > 260 chars relative ⇒ copy exceeds on any root
+
+	// Local LOSER (low mtime) holds its bytes; remote WINNER (high mtime) differs ⇒ this
+	// side would mint the copy. Recorded only (hasLocalContent reads e.files, not disk).
+	local := liveFI(longKey, "local-loser", 1, vv(1, 1))
+	e.mu.Lock()
+	e.files[longKey] = local
+	e.mu.Unlock()
+
+	var (
+		logMu   sync.Mutex
+		flagged bool
+	)
+	e.logf = func(format string, args ...any) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		if strings.Contains(fmt.Sprintf(format, args...), ErrMaxPathExceeded.Error()) {
+			flagged = true
+		}
+	}
+
+	fc := newFakeConn(0x24)
+	ps := e.registerFakePeer(fc)
+	ps.index[longKey] = liveFI(longKey, "remote-winner", 100, vv(2, 1))
+
+	e.reconcileWithPeer(ps)
+
+	if n := len(ps.fetchQ); n != 0 {
+		t.Fatalf("an over-MAX_PATH conflict enqueued %d task(s) — must refuse", n)
+	}
+	if ps.inflight[longKey] {
+		t.Fatalf("over-MAX_PATH conflict left an in-flight entry — must refuse cleanly")
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	if !flagged {
+		t.Fatalf("over-MAX_PATH conflict copy was not flagged with %v", ErrMaxPathExceeded)
+	}
+	// The loser's recorded leaf is untouched (no destructive op).
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if fi := e.files[longKey]; fi.Deleted || fi.ContentHash != merkle.HashBytes([]byte("local-loser")) {
+		t.Fatalf("loser was altered by a refused over-MAX_PATH conflict: %+v", fi)
+	}
+}
+
 // ---------- WS-4 #9: REQUEST validation + clean decline ----------
 
 func TestValidateRequest(t *testing.T) {

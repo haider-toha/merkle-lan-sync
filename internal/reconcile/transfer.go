@@ -48,6 +48,13 @@ var (
 	// (directory wins, file -> .sync-conflict copy) is the logged forward path
 	// (decisions/phase7/MK-2-file-vs-dir-typeclash-resolution.md).
 	ErrTypeClash = errors.New("reconcile: refused file-vs-directory type clash")
+	// ErrMaxPathExceeded is the refuse+flag verdict when a conflict-copy canonical key
+	// would exceed Windows MAX_PATH (260) on a Windows target whose long-path support is
+	// not confirmed: minting it risks a copy a Windows peer cannot write, so v1 REFUSES
+	// the whole conflict (the loser stays at its path, never overwritten — no data lost)
+	// and FLAGS it, the same accepted carve-out as ErrCaseClobber / ErrTypeClash
+	// (XP-3, decisions/crossplatform/maxpath-longpath-handling.md; PR-3 §6).
+	ErrMaxPathExceeded = errors.New("reconcile: refused conflict copy exceeding Windows MAX_PATH")
 )
 
 // numBlocks is the number of 32 KiB blocks a file of size bytes splits into (0 for an
@@ -216,11 +223,15 @@ func (e *Engine) localSource(hash [32]byte, excludeKey string) (string, bool) {
 // loop (CDD-1). Order: idempotence skip -> no-clobber refuse -> local reuse -> network
 // fetch. v1 materialises regular files; a non-regular leaf (symlink) is flagged and
 // skipped (XP-6, N14 — symlinks lossy/deferred).
-func (e *Engine) materialise(ctx context.Context, ps *peerState, leaf merkle.FileInfo, advertise bool) {
+//
+// It returns whether the content landed (ok). The caller (runFetch) uses the return to
+// gate a coupled conflict's winner step on the loser copy actually succeeding; the
+// reported completion (the loop's record/advertise) is orthogonal to the return.
+func (e *Engine) materialise(ctx context.Context, ps *peerState, leaf merkle.FileInfo, advertise bool) bool {
 	if leaf.Type != merkle.TypeFile {
 		e.logf("skip non-regular leaf %q (type %d) — symlink sync is a v1 limitation (XP-6)", leaf.Path, leaf.Type)
 		e.report(completion{leaf: leaf, ok: false, advertise: advertise, peer: ps.short})
-		return
+		return false
 	}
 	host := pathnorm.HostTarget()
 	osPath := pathnorm.ToOSPath(e.absRoot, leaf.Path, host)
@@ -228,13 +239,13 @@ func (e *Engine) materialise(ctx context.Context, ps *peerState, leaf merkle.Fil
 	// 1. Idempotence (SR-3): the file already holds exactly this content.
 	if h, err := merkle.HashFile(osPath); err == nil && h == leaf.ContentHash {
 		e.report(completion{leaf: leaf, ok: true, advertise: advertise, peer: ps.short})
-		return
+		return true
 	}
 	// 2. No-clobber by the filesystem's verdict (CDD-5).
 	if other, clash := e.noClobberConflict(leaf.Path); clash {
 		e.logf("%v: %q would clobber existing %q on this filesystem — refused", ErrCaseClobber, leaf.Path, other)
 		e.report(completion{leaf: leaf, ok: false, clobber: true, advertise: advertise, peer: ps.short})
-		return
+		return false
 	}
 	// 3. Local content-addressed reuse (zero network — rename / dedup).
 	if srcOS, ok := e.localSource(leaf.ContentHash, leaf.Path); ok {
@@ -249,7 +260,7 @@ func (e *Engine) materialise(ctx context.Context, ps *peerState, leaf merkle.Fil
 		})
 		if err == nil {
 			e.report(completion{leaf: leaf, ok: true, advertise: advertise, peer: ps.short})
-			return
+			return true
 		}
 		e.logf("local reuse for %q failed (%v); fetching over the wire", leaf.Path, err)
 	}
@@ -260,7 +271,9 @@ func (e *Engine) materialise(ctx context.Context, ps *peerState, leaf merkle.Fil
 	if err != nil {
 		e.logf("fetch %q from %d failed: %v", leaf.Path, ps.short, err)
 	}
-	e.report(completion{leaf: leaf, ok: err == nil, advertise: advertise, peer: ps.short})
+	ok := err == nil
+	e.report(completion{leaf: leaf, ok: ok, advertise: advertise, peer: ps.short})
+	return ok
 }
 
 // fetchOverWire pulls leaf's bytes one 32 KiB block at a time (stop-and-wait: ≤1

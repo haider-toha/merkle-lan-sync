@@ -192,6 +192,24 @@ func waitRootChanged(t *testing.T, n *node, baseline [32]byte, timeout time.Dura
 	t.Fatalf("root did not change within %v (local authorship not detected)", timeout)
 }
 
+// waitRecordedMtimeAtLeast polls until n's recorded leaf for rel carries a ModTimeNS at
+// least minNS (used to confirm a rescan has absorbed an os.Chtimes mtime-only change
+// before the file is deleted, so a synthesized tombstone inherits that mtime). Uses >=
+// to be robust to filesystem mtime granularity.
+func waitRecordedMtimeAtLeast(t *testing.T, n *node, rel string, minNS int64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, fi := range n.eng.Snapshot() {
+			if fi.Path == rel && !fi.Deleted && fi.ModTimeNS >= minNS {
+				return
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("node did not record mtime >= %d for %q within %v", minNS, rel, timeout)
+}
+
 func write(t *testing.T, dir, rel, content string) {
 	t.Helper()
 	p := filepath.Join(dir, filepath.FromSlash(rel))

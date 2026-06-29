@@ -84,19 +84,29 @@ func resolve(local, remote *merkle.FileInfo, self protocol.ShortID) plan {
 }
 
 // conflictPlan builds the symmetric keep-both verdict. The winner stays at the path
-// with the merged VV (both peers compute the same winner + same merged VV ⇒ the path
-// converges); the loser, if it has content, becomes a .sync-conflict copy at a
-// deterministic new path (both peers mint/receive the identical leaf ⇒ the copy
-// converges). A losing tombstone yields no copy (no bytes to preserve). No content is
-// ever dropped (SR-7). On the theoretical conflict-name error, it degrades to NoOp so
-// nothing is lost (the conflict is left unresolved + flagged, never destructive).
+// keeping ITS OWN version vector (the winner is the same replicated leaf on both peers,
+// so both record the identical winner VV ⇒ the path converges); the loser, if it has
+// content, becomes a .sync-conflict copy at a deterministic new path (both peers
+// mint/receive the identical leaf ⇒ the copy converges). A losing tombstone yields no
+// copy (no bytes to preserve). No content is ever dropped (SR-7). On the theoretical
+// conflict-name error, it degrades to NoOp so nothing is lost (the conflict is left
+// unresolved + flagged, never destructive).
+//
+// The winner deliberately does NOT merge the loser's VV into its own (the WS-4 original
+// did `Merge(localV, remoteV)`). Merging manufactures FALSE causality: the winner would
+// then DOMINATE the genuinely-concurrent loser, so a peer still holding the loser's
+// version — including a winning TOMBSTONE broadcast back to the loser's own custodian —
+// resolves it as a plain dominated-overwrite/delete and DROPS the loser with no copy
+// (the PR-3 cross-peer data-loss the merge caused; a 3rd peer holding the loser loses it
+// too). Keeping the winner's own VV makes every holder of the loser see a true Concurrent
+// conflict and preserve it. Convergence is unaffected: the winner leaf is identical on
+// both peers either way (decisions/phase7/PR-3-conflict-no-data-loss-ordering.md).
 func conflictPlan(local, remote merkle.FileInfo) plan {
 	w := winner(local, remote)
 	l := loserOf(local, remote)
 
 	win := w
-	win.Path = local.Path
-	win.Version = local.Version.Merge(remote.Version)
+	win.Path = local.Path // == remote.Path; keep the winner's own Version (no false-dominating merge)
 
 	p := plan{kind: planConflict, winner: win, flag: "conflict"}
 	if l.Deleted {
