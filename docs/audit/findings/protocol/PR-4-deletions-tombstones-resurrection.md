@@ -3,16 +3,39 @@
 - Phase / role: Phase 2 — protocol-researcher
 - Severity: **high** (a resurrected deletion is "inverse data loss" — the file you
   deleted comes back — and is the marquee long-lived sync bug, Syncthing #10590)
-- Status: **fixed** (WS-4) — `merkle.SetDeleted` tombstones with bumped-VV dominance
-  resist resurrection (a stale peer's pre-delete file is `DominatedBy` ⇒ deleted, not
-  re-created); `canGC` ack-gates symmetric tombstone GC and `DropCounter` strips a
-  de-paired device's counter, both in `internal/reconcile/tombstone.go`; an applied
-  tombstone is re-advertised once (origin VV) so both peers GC together. Verified by
-  `reconcile_test.go` (`TestCanGC`, `TestGCTombstones_AckGated`,
-  `TestTombstone_NoResurrectionAndPrematureGCNegative` — the premature-GC negative
-  proves the gate is load-bearing) + integration `TestDeletion_NoResurrection`.
-  Decision `docs/audit/decisions/ws4/tombstone-lifecycle-rename-and-no-clobber.md`.
-  Commit `af12de099165f38e11556555acc986b9ba385f24`. (Implements SR-9/SR-10; backs
+- Status: **fixed** (Phase 7 round 1, commit `9b5e9c503ec89aa692abc1e7285d46a4c41a3cef`).
+  The stale-peer anti-resurrection invariant (§5) shipped **sound** in WS-4 (`af12de0`):
+  `merkle.SetDeleted` tombstones with bumped-VV dominance resist resurrection (a stale
+  peer's pre-delete file is `DominatedBy` ⇒ deleted, not re-created); `canGC` ack-gates
+  symmetric tombstone GC (retain-on-no-peer, never a timer); an applied tombstone is
+  re-advertised once (origin VV) so both peers GC together. **But the WS-4 "fixed" verdict
+  was REFUTED by 2/3 Phase 6 review skeptics** — correctly: the named ghost-counter
+  mitigation (#10590 / FM-1, §5.1) credited `DropCounter`, yet that method had **zero
+  production callers** (no device-removal path was wired in `cmd/msync`) and was itself
+  untested, so the ghost-counter resurrection was **not** prevented in the running binary
+  (dead, unreachable code); and obligation #5 lacked integration coverage. Phase 7 round 1:
+  (1) the prune is now **wired** — `Config.Peers` declares the paired set and
+  `startupReconcile`'s `sweepDepairedCountersLocked` strips, from every loaded leaf's VV,
+  any counter for a device no longer in `{self} ∪ Peers` (a de-paired device's permanent
+  ghost), gated on the set being known (nil ⇒ retain-all); `cmd/msync` threads the `-peer`
+  set in. It never drops a live device's counter, so SR-10 dominance among live devices is
+  preserved.
+  (2) proven **load-bearing** — `TestGhostCounter_ResurrectionPreventedByDrop` (with the
+  ghost ⇒ resurrection-as-conflict on both sides; after the drop ⇒ clean delete),
+  `TestDropCounter_SweepsAllLeavesAndRebuilds`, `TestSweepDepairedCounters`,
+  `TestEngine_StartupSweepsDepairedGhostCounter` (wired via `New`).
+  (3) **obligation #5** end-to-end — integration
+  `TestRestart_PendingTombstoneSurvivesAndNoResurrection` (a not-yet-acked tombstone
+  authored live, persisted, RELOADED at restart, still dominates a stale peer).
+  §5 stays verified by `TestCanGC`, `TestGCTombstones_AckGated`,
+  `TestTombstone_NoResurrectionAndPrematureGCNegative`, integration
+  `TestDeletion_NoResurrection`; **obligation #4** (delete-vs-modify, no loss) by the PR-3
+  fix (`TestResolver_DeleteWinsPreservesModification`,
+  `TestConflict_DeleteVsModify_NoLossBothPeers`) plus `TestResolver_ModifyWinsKeepsLiveFile`.
+  Decisions `docs/audit/decisions/ws4/tombstone-lifecycle-rename-and-no-clobber.md`,
+  `protocol/tombstone-retention-gc.md`, `protocol/vv-pruning-counter-cleanup.md`,
+  `phase7/PR-4-ghost-counter-wiring-and-test-obligations.md`. Runtime *hot* un-pair is the
+  documented deferred path. (Implements SR-9/SR-10; backs
   `decisions/protocol/tombstone-retention-gc.md` and `vv-pruning-counter-cleanup.md`.)
 - Reads-first honoured: `sync-rules.md` SR-9/SR-10, `findings/literature/syncthing-bep.md`
   §4.5/§10.5, `findings/literature/version-vectors.md` FM-1/§4.3, SKILL §4.
@@ -98,8 +121,18 @@ still carry a pre-delete version**.
   peer's index shows it holds the tombstone, then GC symmetrically.
 - **Ghost counters (#10590 / FM-1):** a *removed* device leaves a permanent counter so
   *neither* vector can dominate → "deleted files resurrect as clean copies (no
-  sync-conflict marker)" (#10590, accessed 2026-06-28). Mitigated by ack-gated
-  `DropCounter` on explicit device removal (`vv-pruning-counter-cleanup.md`).
+  sync-conflict marker)" (#10590, accessed 2026-06-28). Mitigated by the **device-removal
+  de-pair sweep** `sweepDepairedCountersLocked` (sharing `DropCounter`'s copy-on-write
+  core): at startup any counter for a device no longer in the declared paired set
+  (`Config.Peers`, threaded from `cmd/msync`'s `-peer`) is pruned from every leaf's VV, so
+  a de-paired device's ghost can no longer block tombstone dominance. Gated on the paired
+  set being known (nil ⇒ retain-all); it never drops a live device's counter; it must be
+  applied on **both** peers (symmetric pruning — a one-sided change transiently un-prunes,
+  never data loss). Proven load-bearing by `TestGhostCounter_ResurrectionPreventedByDrop`
+  and wired-at-startup by `TestEngine_StartupSweepsDepairedGhostCounter` (Phase 7 round 1,
+  commit `9b5e9c5`; `vv-pruning-counter-cleanup.md`,
+  `phase7/PR-4-ghost-counter-wiring-and-test-obligations.md`). Runtime *hot* un-pair (an
+  ack-gated CLOSE handshake) is deferred.
 - **Counter rollback (FM-4):** a wiped peer re-authoring with a low counter could make a
   tombstone fail to dominate; mitigated by the persisted-snapshot + cold-start reseed
   (`vv-counter-seeding.md`).
