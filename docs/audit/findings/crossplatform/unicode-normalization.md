@@ -4,7 +4,7 @@
 > in `internal/pathnorm/normalize.go` (`golang.org/x/text/unicode/norm`, pinned
 > v0.27.0 for the go-1.23 baseline) and applied in `Canonicalize`/`CanonicalizeSlash`;
 > NFD->NFC round-trip tests green. The Windows end of the cross-OS round-trip is
-> Phase-6. Commit `__WS1_SHA__`.
+> Phase-6. Commit `182ff00a16868df05377cb3585b914aa1d59784e`.
 
 - Slug: `unicode-normalization` · confirms **XP-2**
 - Phase: 2 (crossplatform-researcher, elevated track)

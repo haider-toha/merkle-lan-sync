@@ -5,7 +5,7 @@
 > stripping are implemented in `internal/pathnorm/pathnorm.go` (`ToOSPath`/
 > `FromOSPath`/`Canonicalize`, target-parameterised so Windows separators are tested
 > on the Mac); tests green. Deep-tree round-trip on real Windows is Phase-6. Commit
-> `__WS1_SHA__`.
+> `182ff00a16868df05377cb3585b914aa1d59784e`.
 
 - Slug: `path-separators` · confirms **XP-1**
 - Phase: 2 (crossplatform-researcher, elevated track)

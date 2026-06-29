@@ -7,7 +7,7 @@
   diff are implemented and tested in `internal/merkle/{snapshot.go,scanner.go}`
   (decision `docs/audit/decisions/ws1/snapshot-and-deletion-synthesis.md`); the
   WS-4 startup wiring (calling these at boot) remains for WS-4. Fixed by commit
-  `__WS1_SHA__`.
+  `182ff00a16868df05377cb3585b914aa1d59784e`.
 - Severity: **high** (this is synthesis risk **R-5**, "the least-mitigated risk";
   no existing rule covers it; the failure is missed deletions / resurrection /
   divergence after a restart)

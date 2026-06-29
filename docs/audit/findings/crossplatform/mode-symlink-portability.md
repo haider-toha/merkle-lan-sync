@@ -7,7 +7,7 @@
 > (not followed); 2-state and symlink-distinct-hash tests green. Decision
 > `docs/audit/decisions/ws1/structural-hash-grammar-finalization.md`. The exec-bit /
 > symlink on-disk behaviour on Windows (incl. refuse+flag on unprivileged) is
-> WS-4/Phase-6. Commit `__WS1_SHA__`.
+> WS-4/Phase-6. Commit `182ff00a16868df05377cb3585b914aa1d59784e`.
 
 - Slug: `mode-symlink-portability` · confirms **XP-6** and **amends** the Phase 0
   leaf-shape structural-hash recipe

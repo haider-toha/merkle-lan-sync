@@ -4,7 +4,7 @@
 > (`IsWindowsUnsafe`/`EscapeForWindows`/`UnescapeFromWindows`, MAX_PATH check) is
 > implemented in `internal/pathnorm/windows.go`; the Windows-hostile table
 > round-trips lossless and the escaping is total/injective under test. Decisions
-> `docs/audit/decisions/ws1/pathnorm-api-and-target-model.md`. Commit `__WS1_SHA__`.
+> `docs/audit/decisions/ws1/pathnorm-api-and-target-model.md`. Commit `182ff00a16868df05377cb3585b914aa1d59784e`.
 > The actual on-disk write of an escaped name / NTFS ADS / reserved-name rejection /
 > >260 write remain Phase-6 (windows-latest + checklist).
 

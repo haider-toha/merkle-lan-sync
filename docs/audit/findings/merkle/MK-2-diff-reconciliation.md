@@ -6,7 +6,7 @@
   implemented in `internal/merkle/differ.go` with the "absence is ambiguous →
   single-sided candidate" rule and a white-box prune assertion test; the VV/tombstone
   resolver that consumes it stays in `internal/reconcile` (WS-4). Decision
-  `docs/audit/decisions/ws1/tree-representation-and-differ.md`. Commit `__WS1_SHA__`.
+  `docs/audit/decisions/ws1/tree-representation-and-differ.md`. Commit `182ff00a16868df05377cb3585b914aa1d59784e`.
 - Severity: **medium** (foundational to SR-5; two correctness subtleties — "absence
   is ambiguous" and the honest complexity bound — are easy to get wrong)
 - Date / access date for all URLs: 2026-06-28

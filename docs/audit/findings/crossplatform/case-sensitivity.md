@@ -5,7 +5,7 @@
 > `internal/pathnorm/casefold.go` and catches both case and normalisation collisions
 > under test. The no-clobber ENFORCEMENT is the filesystem's own verdict on the WS-4
 > apply path (CDD-5), and the real NTFS `$UpCase` matrix is Phase-6. Commit
-> `__WS1_SHA__`.
+> `182ff00a16868df05377cb3585b914aa1d59784e`.
 
 - Slug: `case-sensitivity` · confirms **XP-4**
 - Phase: 2 (crossplatform-researcher, elevated track)

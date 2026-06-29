@@ -6,7 +6,7 @@
   + mtime + version_vector + deleted) is implemented in `internal/merkle/fileinfo.go`
   with the structural hash committing to {content_hash, 2-state mode, deleted, VV} and
   excluding raw mode/mtime/size; tombstone-distinct-hash test green. Commit
-  `__WS1_SHA__`. (Originally: complete; backs
+  `182ff00a16868df05377cb3585b914aa1d59784e`. (Originally: complete; backs
   `decisions/merkle/leaf-shape-and-structural-hash.md`.)
 - Severity: **high** (getting the leaf metadata wrong = silent data loss or
   permanent non-convergence; this is the load-bearing definition of two-way sync)
