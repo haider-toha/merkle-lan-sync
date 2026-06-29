@@ -3,8 +3,9 @@
 - Phase / role: Phase 2 — protocol-researcher
 - Severity: **high** (authentication gates *all* file data; an unauthenticated peer
   that can feed us writes is a direct corruption + exfiltration channel)
-- Status: open (research finding; backs `decisions/protocol/transport-security-tofu-confirm.md`
-  and confirms Phase 0 `transport-security-tofu-vs-plaintext.md`)
+- Status: fixed (WS-2 — see Implementation status; backs
+  `decisions/protocol/transport-security-tofu-confirm.md` and confirms Phase 0
+  `transport-security-tofu-vs-plaintext.md`)
 - Reads-first honoured: `decisions/phase0/transport-security-tofu-vs-plaintext.md`,
   `go-rules.md` GR-11, `findings/codebases/syncthing-source.md` A2-1, SKILL §7.
 - Evidence: device-ID derivation + TOFU re-verified at
@@ -120,8 +121,41 @@ and `ParseDeviceID`. Tests (`deviceid_test.go`, green under `-race`):
 `TestShort_IsVersionVectorKey`, `TestDeviceID_HexRoundTrip`, `TestDeviceID_Comparable`
 — this is §7 obligation #4.
 
-**Remaining (other workstreams) — this finding stays `open`:** §4 hardening
-(`tls.Config.VerifyConnection` pinning `SHA-256(PeerCertificates[0].Raw)` against the
-allow-list, `MinVersion: VersionTLS13`, HELLO re-asserting the DeviceID), §5 the TOFU
-allow-list, and §7 obligations 1–3 are all WS-2 (`internal/transport`). Representation
-choice logged in `docs/audit/decisions/ws0/deviceid-type-and-derivation.md`.
+## Implementation status (WS-2 — complete)
+
+**Landed in WS-2** — commit `<WS2-COMMIT-SHA>` on branch `feat/merkle-sync-engine`
+(`internal/transport/{identity.go, tls.go, conn.go, transport.go, listener.go,
+dial.go, doc.go}`): all of the previously-remaining §4 hardening + §5 TOFU allow-list
++ §7 obligations 1–3.
+
+- **§3 cert side of identity:** `GenerateIdentity` / `LoadOrCreateIdentity` mint a
+  self-signed ECDSA P-256 cert and derive `DeviceID = SHA-256(leaf DER)` via the
+  WS-0 `protocol.DeviceIDFromCert`; the cert is persisted (atomic 0600 key) so the
+  DeviceID is stable across restarts (decision
+  `decisions/ws2/device-identity-cert-and-persistence.md`).
+- **§4.1 pin in `VerifyConnection`, before any frame is read:** `baseTLSConfig` sets
+  `MinVersion == MaxVersion == VersionTLS13`, `InsecureSkipVerify: true`, and
+  `VerifyConnection = pinVerifier(allow)` computing `SHA-256(PeerCertificates[0].Raw)`
+  and rejecting (`ErrUntrustedDevice`) unless allow-listed; the server adds
+  `ClientAuth: RequireAnyClientCert` so the dialer's cert is pinned too. A wrong
+  fingerprint fails the handshake before any HELLO/frame is read
+  (`TestTLS_WrongFingerprintRejected`, `TestPinVerifier`; decision
+  `decisions/ws2/tls-config-and-deviceid-pinning.md`).
+- **§4.2 HELLO re-asserts identity in-band:** `establish` exchanges HELLO after the
+  TLS pin and drops on `HELLO.DeviceID != TLS-pinned`
+  (`ErrHelloDeviceMismatch`, `TestHELLO_DeviceIDMismatchDropped`); the engine's HELLO
+  fields ride out on `PeerConnected` (`TestHello_CarriesEngineFields`; decision
+  `decisions/ws2/connection-establishment-events-and-hello.md`).
+- **§4.3 discovery is a hint:** transport authenticates exclusively at the TLS layer;
+  no state is trusted from any announce (WS-3 carries the announce side).
+- **§5 paired allow-list:** `Allowlist` (concurrency-safe `Add`/`Remove`/`Allowed`)
+  is the TOFU allow-list (`TestAllowlist_*`).
+- **§7 obligations 1–3:** #1 right/wrong fingerprint (`TestTLS_PinsIdentity` +
+  `TestTLS_WrongFingerprintRejected`), #2 HELLO mismatch dropped
+  (`TestHELLO_DeviceIDMismatchDropped`), #3 spoofed-announce⇒unknown TLS identity
+  rejected (covered by the same pin + allow-list path; the announce-spoof side is
+  WS-3's `TestDiscovery_AnnounceIsNotAuth`). Obligation #4 was already WS-0.
+
+All green under `go test ./... -race`.
+
+## Implementation status (WS-0 — partial, superseded)

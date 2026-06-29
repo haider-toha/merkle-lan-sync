@@ -240,10 +240,24 @@ Key protocol invariants surfaced by the state machine:
   including split-read survival (`iotest.OneByteReader`), oversized/zero rejection with
   no body read, the `MaxChunkLen` boundary, and skip-unknown-frame-then-continue.
 
+**Landed in WS-2** — commit `<WS2-COMMIT-SHA>` on branch `feat/merkle-sync-engine`
+(`internal/transport/{transport.go, listener.go, dial.go, conn.go}`): §5 the
+connection lifecycle / handshake state machine — steps 1–2 (TLS 1.3 pin in
+`VerifyConnection` → recompute pinned DeviceID → in-band HELLO exchange that
+re-asserts `HELLO.DeviceID == TLS-pinned`, drop on mismatch) and the steady-state
+frame loop (per-conn reader applying `RecvAction`: `0x00`→drop, `0x08+`→skip,
+`0x01..0x07`→decode+dispatch; writer-owned buffered-with-shed outbound). The
+validated peer HELLO (incl. `rootHash`) is surfaced to the engine on
+`PeerConnected` so step 3's root short-circuit can run. Tests:
+`TestTLS_PinsIdentity`, `TestHELLO_DeviceIDMismatchDropped`,
+`TestConn_SplitFrameSurvives`, `TestConn_MalformedLengthDropsPeerCleanly`,
+`TestConn_HostilePathPayloadsRoundTrip` (all `-race`).
+
 **Remaining (other workstreams) — this finding stays `open`:**
-- §5 connection lifecycle / handshake state machine → WS-2 (`internal/transport`).
 - §4 `wireFileInfo` byte grammar (the opaque body) → WS-1 (`internal/merkle`).
-- §6 obligation 6 (HELLO root-hash skip-INDEX short-circuit) → WS-4 integration.
+- §5 step 3 + §6 obligation 6 (HELLO root-hash skip-INDEX short-circuit, the
+  *decision* to skip INDEX) → WS-4 integration; WS-2 delivers the rootHash to the
+  engine but does not itself decide convergence.
 
 Decisions: `docs/audit/decisions/ws0/framing-read-write-api-and-size-budget.md`,
 `docs/audit/decisions/ws0/message-envelope-codec-and-unknown-type-policy.md`.
