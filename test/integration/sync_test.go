@@ -462,9 +462,15 @@ func TestRename_PropagatesNoLoss(t *testing.T) {
 
 	// Rename on A while connected; A's rescan emits create(new.txt)+delete(old.txt),
 	// ordered creates-before-deletes so a peer never transiently loses the only copy.
+	preRename := a.eng.RootHash()
 	if err := os.Rename(filepath.Join(dirA, "old.txt"), filepath.Join(dirA, "new.txt")); err != nil {
 		t.Fatal(err)
 	}
+	// Wait for A to DETECT its own rename before asserting convergence: otherwise, under
+	// load (A's rescan delayed past the waitConverged settle window), waitConverged could
+	// observe the STALE pre-rename converged state (both nodes still at preRename) and
+	// return a false positive (REV-FLAKE-1 oracle TOCTOU).
+	waitRootChanged(t, a, preRename, budgetAuthor)
 	waitConverged(t, a, b, budgetConverge)
 
 	for name, n := range map[string]*node{"A": a, "B": b} {
@@ -502,9 +508,13 @@ func TestRename_AfterSortingOrder_PropagatesNoLoss(t *testing.T) {
 		t.Fatalf("precondition: B should hold a.txt=%q, got %q ok=%v", payload, got, ok)
 	}
 
+	preRename := a.eng.RootHash()
 	if err := os.Rename(filepath.Join(dirA, "a.txt"), filepath.Join(dirA, "z.txt")); err != nil {
 		t.Fatal(err)
 	}
+	// As in TestRename_PropagatesNoLoss: gate convergence on A actually detecting its own
+	// rename, so the stale pre-rename converged state can't pass waitConverged (REV-FLAKE-1).
+	waitRootChanged(t, a, preRename, budgetAuthor)
 	waitConverged(t, a, b, budgetConverge)
 
 	for name, n := range map[string]*node{"A": a, "B": b} {

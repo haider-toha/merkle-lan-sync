@@ -210,13 +210,43 @@ func waitRecordedMtimeAtLeast(t *testing.T, n *node, rel string, minNS int64, ti
 	t.Fatalf("node did not record mtime >= %d for %q within %v", minNS, rel, timeout)
 }
 
+// write publishes content at rel ATOMICALLY: it streams into a .msync-* temp in the
+// SAME directory (which the engine's internalFile filter ignores if a rescan catches it)
+// then os.Renames it into place, so the engine's rescan only ever observes the file
+// ABSENT or FULLY-PRESENT — never the empty/partial window os.WriteFile opens between its
+// O_CREATE|O_TRUNC and its Write. That window is a real change-detection race: a rescan
+// catching the empty file authors+broadcasts an empty version, then a later rescan
+// authors+broadcasts the full version, so a single logical edit emits TWO INDEX_UPDATEs
+// and breaks the bounded-broadcast oracle under load (REV-FLAKE-1). Real editors save via
+// the same temp+rename, so this is the realistic publish, not a test crutch.
 func write(t *testing.T, dir, rel, content string) {
 	t.Helper()
 	p := filepath.Join(dir, filepath.FromSlash(rel))
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	parent := filepath.Dir(p)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+	tmp, err := os.CreateTemp(parent, ".msync-writetmp-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		t.Fatal(err)
+	}
+	if err := tmp.Chmod(0o644); err != nil { // os.CreateTemp is 0o600; match the prior os.WriteFile mode
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		t.Fatal(err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmpName, p); err != nil {
+		_ = os.Remove(tmpName)
 		t.Fatal(err)
 	}
 }

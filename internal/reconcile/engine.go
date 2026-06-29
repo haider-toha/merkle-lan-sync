@@ -1157,7 +1157,7 @@ func (e *Engine) onLocalChange(key string) {
 		e.logf("reconcile: rehash %q: %v", key, err)
 		return
 	}
-	if had && !prev.Deleted && prev.ContentHash == nfi.ContentHash && prev.Type == nfi.Type {
+	if had && !prev.Deleted && prev.ContentHash == nfi.ContentHash && prev.Type == nfi.Type && prev.Size == nfi.Size {
 		if prev.ModTimeNS != nfi.ModTimeNS { // content identical, only mtime moved ⇒ quiet update
 			prev.ModTimeNS = nfi.ModTimeNS
 			e.mu.Lock()
@@ -1166,6 +1166,10 @@ func (e *Engine) onLocalChange(key string) {
 		}
 		return // echo / no new authorship (SR-8)
 	}
+	// Size is part of the "unchanged" key (not just ContentHash): with HashFileSize a
+	// matching hash already implies a matching size, so this never spuriously re-authors a
+	// genuine echo — but it DOES heal a pre-existing torn leaf (Size⊥hash from an old
+	// snapshot or a cross-version peer) by treating the Size delta as a change (REV-FLAKE-1).
 	nfi.Version = prev.Version.Bump(e.selfShort) // prev.Version is empty for a new file
 	e.mu.Lock()
 	e.files[key] = nfi
@@ -1194,7 +1198,11 @@ func (e *Engine) rescan() {
 	e.mu.Lock()
 	for _, s := range scanned {
 		prev, had := e.files[s.Path]
-		if had && !prev.Deleted && prev.ContentHash == s.ContentHash && prev.Type == s.Type {
+		// Size joins ContentHash+Type in the unchanged key: post-HashFileSize a matching
+		// hash implies a matching size (no spurious re-author of a true echo), but a Size
+		// delta with an equal hash means a torn/legacy leaf, which is healed by re-authoring
+		// the now-consistent scan rather than masked as "unchanged" (REV-FLAKE-1).
+		if had && !prev.Deleted && prev.ContentHash == s.ContentHash && prev.Type == s.Type && prev.Size == s.Size {
 			if prev.ModTimeNS != s.ModTimeNS {
 				prev.ModTimeNS = s.ModTimeNS
 				e.files[s.Path] = prev
@@ -1260,13 +1268,16 @@ func (e *Engine) scanOne(key, osPath string, info os.FileInfo) (merkle.FileInfo,
 		fi.Size = uint64(len(norm))
 		return fi, nil
 	}
-	h, err := merkle.HashFile(osPath)
+	// Size from the hashed byte count, not info.Size(): the Lstat that produced info and
+	// this read are non-atomic, so a concurrent rewrite would tear Size from ContentHash
+	// (REV-FLAKE-1). HashFileSize couples them so the leaf is always self-consistent.
+	h, n, err := merkle.HashFileSize(osPath)
 	if err != nil {
 		return fi, err
 	}
 	fi.Type = merkle.TypeFile
 	fi.ContentHash = h
-	fi.Size = uint64(info.Size())
+	fi.Size = uint64(n)
 	return fi, nil
 }
 

@@ -31,6 +31,16 @@ type Conn struct {
 
 	outbound chan protocol.Message
 
+	// registered is closed by Transport.register AFTER it has emitted PeerConnected for
+	// this conn. deliver blocks on it so NO inbound PeerMessage can reach the fan-in
+	// events channel before PeerConnected does. Without this gate the reader (started in
+	// newConn) races register's PeerConnected emit on the shared events channel; a peer's
+	// first message (e.g. its one-shot INDEX) could arrive before the engine has
+	// registered the peer, and handleMessage silently drops a message for an unknown peer
+	// — permanently wedging convergence with no re-exchange (REV-FLAKE-1, the backpressure
+	// residual; decisions/phase7/REV-FLAKE-1-torn-scan-size-hash.md).
+	registered chan struct{}
+
 	closeOnce sync.Once
 	closeErr  error // set exactly once inside closeOnce; read after wg.Wait()
 	closed    chan struct{}
@@ -78,13 +88,14 @@ func (c *Conn) closeWith(err error) {
 
 func (t *Transport) newConn(tlsConn *tls.Conn, id protocol.DeviceID, hello protocol.Hello) *Conn {
 	c := &Conn{
-		connID:   t.nextConnID.Add(1),
-		deviceID: id,
-		hello:    hello,
-		tlsConn:  tlsConn,
-		t:        t,
-		outbound: make(chan protocol.Message, t.outBuf),
-		closed:   make(chan struct{}),
+		connID:     t.nextConnID.Add(1),
+		deviceID:   id,
+		hello:      hello,
+		tlsConn:    tlsConn,
+		t:          t,
+		outbound:   make(chan protocol.Message, t.outBuf),
+		registered: make(chan struct{}),
+		closed:     make(chan struct{}),
 	}
 	c.wg.Add(2)
 	go c.readLoop()
@@ -133,8 +144,18 @@ func (c *Conn) readLoop() {
 }
 
 // deliver hands an inbound message to the engine via the fan-in Events channel,
-// without deadlocking at shutdown.
+// without deadlocking at shutdown. It first waits until this conn has been registered
+// (PeerConnected emitted) so the engine cannot receive a PeerMessage for a peer it has
+// not yet registered — which handleMessage would silently drop (REV-FLAKE-1). A conn
+// closed before registration (transport shutting down) unblocks the reader via closed.
 func (c *Conn) deliver(msg protocol.Message) bool {
+	select {
+	case <-c.registered:
+	case <-c.closed:
+		return false
+	case <-c.t.closed:
+		return false
+	}
 	select {
 	case c.t.events <- Event{Kind: PeerMessage, DeviceID: c.deviceID, Conn: c, Message: msg}:
 		return true

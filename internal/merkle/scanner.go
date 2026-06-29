@@ -56,13 +56,17 @@ func Scan(absRoot string) ([]FileInfo, error) {
 			fi.ContentHash = HashBytes([]byte(norm))
 			fi.Size = uint64(len(norm))
 		default:
-			h, herr := HashFile(osPath)
+			// Size MUST come from the bytes streamed through the hasher, NOT info.Size():
+			// the stat above and this read are non-atomic, so a file rewritten between them
+			// would yield a torn leaf (Size⊥ContentHash) that is un-transferable and never
+			// self-corrects (REV-FLAKE-1). HashFileSize couples the two into one read.
+			h, n, herr := HashFileSize(osPath)
 			if herr != nil {
 				return herr
 			}
 			fi.Type = TypeFile
 			fi.ContentHash = h
-			fi.Size = uint64(info.Size())
+			fi.Size = uint64(n)
 		}
 		out = append(out, fi)
 		return nil

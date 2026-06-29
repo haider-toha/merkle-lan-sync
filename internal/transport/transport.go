@@ -235,6 +235,12 @@ func (t *Transport) register(c *Conn) bool {
 
 	go t.superviseConn(c)
 	t.emit(Event{Kind: PeerConnected, DeviceID: c.deviceID, Conn: c})
+	// Open the delivery gate ONLY now: PeerConnected is enqueued on the fan-in events
+	// channel, so every subsequent PeerMessage this conn's reader delivers is ordered
+	// strictly after it (FIFO) — the engine always registers the peer before receiving
+	// any of its messages, so the one-shot INDEX can never be dropped as "unknown peer"
+	// (REV-FLAKE-1 backpressure wedge).
+	close(c.registered)
 	return true
 }
 
