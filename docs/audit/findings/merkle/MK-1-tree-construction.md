@@ -2,13 +2,26 @@
 
 - Slug: `MK-1-tree-construction`
 - Phase / role: Phase 2 — merkle-researcher
-- Status: **fixed** (WS-1) — implemented + verified in `internal/merkle/{node.go,
-  codec.go,tree.go}`: RFC-6962 `0x00`/`0x01` domain separation, the byte-exact
-  grammar, n-ary no-duplicate-last, and the one-byte-change minimal-branch property.
-  Golden-vector + cross-platform-root tests green. Decision
-  `docs/audit/decisions/ws1/structural-hash-grammar-finalization.md`. Commit
-  `182ff00a16868df05377cb3585b914aa1d59784e`. (Originally: complete; backs
+- Status: **fixed** (WS-1 + Phase-7 round 1) — implemented + verified in
+  `internal/merkle/{node.go,codec.go,tree.go}`: RFC-6962 `0x00`/`0x01` domain
+  separation, the byte-exact grammar, n-ary no-duplicate-last, and the
+  one-byte-change minimal-branch property. Golden-vector + cross-platform-root tests
+  green. Decision `docs/audit/decisions/ws1/structural-hash-grammar-finalization.md`.
+  Commit `182ff00a16868df05377cb3585b914aa1d59784e`. (Originally: complete; backs
   `decisions/merkle/leaf-shape-and-structural-hash.md`.)
+- **Phase-7 update (2026-06-29):** the *incremental rebuild* pillar (below) was
+  refuted at review — `rehash()`/`BuildTree` do a full O(n) recompute; the claimed
+  O(depth) path did not exist (`docs/audit/findings/review/votes/MK-1-skeptic1.md`,
+  REFUTED; corroborated by skeptic-3 defect #1). Resolved by implementing the real
+  copy-on-write `merkle.Tree.Update` (re-hashes only the changed leaf's root→leaf
+  chain, shares off-path subtrees by pointer; byte-for-byte equal to a full build via
+  the shared `hashFromChildren` recipe). Proven by `TestUpdate_OffPathNodesReusedVerbatim`
+  (pointer-identity branch-touch) + `TestUpdate_EquivalenceFuzz`/`...IncrementalEqualsFullBuild`,
+  with skeptic-3 #2/#3/#4 hardening (`TestBuildTree_OrderIndependent`,
+  `TestBuildTree_RejectsMalformedPathComponents`). Decision
+  `docs/audit/decisions/phase7/MK-1-incremental-rebuild-resolution.md`. Commit
+  `920290f3354e28ada401579d54d17bbfd305829f`. All green under
+  `go build ./... && go test ./... -race` + `GOOS=windows` build.
 - Severity: **medium** (the domain-separation gap is a real, cheap-to-close
   hardening of the Phase 0 spec; the construction itself is foundational to SR-5)
 - Date / access date for all URLs: 2026-06-28
@@ -89,6 +102,14 @@ nesting `D`, unrelated to `log N`) (`literature/merkle-tree.md` §4.5, §5; the 
 *rebuild* rather than *diff* (see `MK-2`). Directory **rename** re-parents a subtree
 and changes every ancestor hash — the Dynamo "key ranges change" analogue
 (`merkle-tree` §4.6); handled by `decisions/merkle/rename-detection.md`.
+
+> **Implementation (Phase-7):** this exact O(depth) recompute is `merkle.Tree.Update`
+> (`internal/merkle/tree.go`): a copy-on-write upsert that re-hashes only the changed
+> leaf's root→leaf chain and reuses every off-path subtree verbatim (shared by
+> pointer), returning a new immutable tree. `rehash()`/`BuildTree` remain the O(n)
+> full-build path (the engine's batch strategy over the authoritative FileInfo map);
+> both paths share one `hashFromChildren` recipe so `Update` is byte-identical to a
+> full build. See `decisions/phase7/MK-1-incremental-rebuild-resolution.md`.
 
 ### Odd-node duplication (CVE-2012-2459) — why we stay n-ary
 
