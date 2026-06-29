@@ -3,16 +3,28 @@
 - Slug: `MK-6-persisted-snapshot-restart-deletion`
 - Phase / role: Phase 2 — merkle-researcher (surfacing the least-mitigated risk in
   the merkle lane; primary decision owner is the Phase 3 tree-critic)
-- Status: **fixed** (WS-1) — the snapshot persist/load + startup `SynthesizeDeletions`
-  diff are implemented and tested in `internal/merkle/{snapshot.go,scanner.go}`
-  (decision `docs/audit/decisions/ws1/snapshot-and-deletion-synthesis.md`). The
-  WS-4 startup wiring is now landed: `internal/reconcile/engine.go`
-  `startupReconcile`/`restoreVVs` load the snapshot, restore version vectors, and call
-  `SynthesizeDeletions` at boot, and the snapshot is persisted on shutdown +
-  periodically (`saveSnapshot`); a missing snapshot enters cold-start reseed
-  (vv-counter-seeding). Fixed by commit
+- Status: **fixed** (WS-1 + WS-4 + Phase 7 round 1). The snapshot persist/load +
+  startup `SynthesizeDeletions` diff are implemented in
+  `internal/merkle/{snapshot.go,scanner.go}` (decision
+  `docs/audit/decisions/ws1/snapshot-and-deletion-synthesis.md`); the WS-4 startup
+  wiring (`internal/reconcile/engine.go` `startupReconcile`/`restoreVVs` →
+  `SynthesizeDeletions` at boot; snapshot persisted on shutdown + periodically; a
+  missing snapshot enters cold-start reseed) landed in
   `182ff00a16868df05377cb3585b914aa1d59784e` (WS-1) +
-  `af12de099165f38e11556555acc986b9ba385f24` (WS-4 wiring).
+  `af12de099165f38e11556555acc986b9ba385f24` (WS-4).
+  **Phase 6 REFUTED the "fixed" verdict** (`docs/audit/findings/review/votes/MK-6-skeptic1.md`,
+  `docs/audit/findings/review/MK-6.skeptic-3.vote.md`): (a) the named two-node
+  deletion-across-restart acceptance test did not exist; (b) `restoreVVs` dropped the
+  persisted tombstone VV on a recreate-over-tombstone, so a file recreated while the
+  daemon was down kept an empty VV and was re-deleted by a peer's tombstone (data
+  loss); (c) the concurrent delete-while-down-vs-remote-edit case was untested.
+  **Phase 7 round 1 closes all three** — `restoreVVs` now bumps the tombstone's VV on a
+  recreate (it dominates the prior delete, mirroring the live recreate paths), and the
+  end-to-end two-node restart suite was added (`TestRestart_SynthesizesDeletionFromSnapshot`,
+  `TestRestart_RecreateOverTombstoneSurvives`, `TestRestart_DeleteWhileDownVsRemoteEdit`)
+  plus a `restoreVVs` unit case. Decision
+  `docs/audit/decisions/phase7/MK-6-restart-recreate-and-concurrent-edit.md`. Fixed by
+  commit `14f60d1ea47e10170d4c6488efe8340ecde1de3e` (Phase 7).
 - Severity: **high** (this is synthesis risk **R-5**, "the least-mitigated risk";
   no existing rule covers it; the failure is missed deletions / resurrection /
   divergence after a restart)
