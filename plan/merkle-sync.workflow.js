@@ -43,15 +43,24 @@ export const meta = {
 }
 
 // ----------------------------------------------------------------------------
-// Config from args (fail-safe default = pilot / research-only)
+// Config (fail-safe default = pilot / research-only)
 // ----------------------------------------------------------------------------
-const A = (args && typeof args === 'object') ? args : {}
+// Orchestrator override for segmented runs: set { from, to, finalize } to force a
+// phase range regardless of how `args` threads through the tool. null = arg-driven
+// (this is the form committed for normal {pilot}/{full} use).
+const RANGE_OVERRIDE = null
+
+let A = {}
+if (RANGE_OVERRIDE && typeof RANGE_OVERRIDE === 'object') A = RANGE_OVERRIDE
+else if (args && typeof args === 'object') A = args
+else if (typeof args === 'string' && args.trim()) { try { A = JSON.parse(args) } catch (e) { A = {} } }
 const full = A.full === true
 const pilot = A.pilot === true || (!full && A.from === undefined && A.to === undefined)
 const START = (A.from !== undefined) ? A.from : 0
 const END = (A.to !== undefined) ? A.to : (pilot ? 2 : 7)
 const DO_FINAL = !pilot && END >= 7 && A.finalize !== false
 const HAS_REMOTE = !!A.remote
+const WS_FILTER = Array.isArray(A.ws) ? A.ws : null // null => all workstreams; else only these ids (Phase 5)
 const on = (n) => n >= START && n <= END
 const MODULE = 'github.com/haider-toha/merkle-sync'
 
@@ -233,26 +242,36 @@ const CRITICS = [
   ['concurrency-critic', 'Go race conditions; is the sync.RWMutex boundary (watcher-writes vs sync-reads) correct & complete; can the watcher and a sync write deadlock; goroutine leaks on peer disconnect; context cancellation paths; channel close semantics.'],
   ['crossplatform-critic', 'does the pathnorm design actually round-trip Mac(NFD)->Windows(NFC)->Mac without mangling names; case-insensitive collision handling without clobber; illegal-char/reserved-name strategy; never storing OS separators in the tree.'],
 ]
+// Aligned with docs/audit/plan/implementation-plan.md (Phase 4 planner added the
+// foundational WS-0 protocol leaf: merkle imports protocol, so protocol must exist
+// first). Sequence: WS-0 -> WS-1 -> {WS-2, WS-3} -> WS-4 (sequential, single tree).
+// Each implementer reads the full ${name} section of the plan for detailed
+// acceptance criteria; the summaries below are orchestration scope hints.
 const WORKSTREAMS = [
+  {
+    id: 'ws0', name: 'WS-0', title: 'Protocol leaf (framing + messages + version vector + device ID) + concurrency/oracle rule amendments',
+    packages: ['internal/protocol', 'docs/audit/rules (GR-4/GR-5/GR-13/SR-5 amendments per CDD-1/CDD-8)'],
+    acceptance: 'a frame survives split reads; malformed/oversized/zero length rejected pre-alloc with a typed sentinel (no stream desync); MaxChunkLen budget asserted on the sender; unknown-type policy total (0x00 fatal, 0x08+ skip); VersionVector Compare(antisymmetric)/Merge(pointwise-max)/Bump(prev+1) all copy-on-write; DeviceIDFromCert deterministic; GR-5/GR-4/GR-13/SR-5 rule amendments landed.',
+  },
   {
     id: 'ws1', name: 'WS-1', title: 'Merkle tree + scanner + pathnorm',
     packages: ['internal/pathnorm', 'internal/merkle'],
-    acceptance: 'scanning the same folder twice yields an IDENTICAL root hash; pathnorm round-trips a Windows-hostile name set without loss; changing one byte in one file changes the root hash and EXACTLY that leaf\'s branch.',
+    acceptance: 'same folder scanned twice => identical root; Windows-hostile name set round-trips lossless + escaping total/injective; one byte changed flips only that leaf\'s branch + root (prune-equal differ); ONE byte-exact structural-hash recipe with RFC-6962 0x00/0x01 domain separation, Mac<->Windows round-trip bit-identical (R-1 gate); tombstone hashes distinct from its pre-delete leaf; persisted local-only snapshot recovers deletion-across-restart (R-5).',
   },
   {
-    id: 'ws2', name: 'WS-2', title: 'Transport (TCP framing + TLS)',
-    packages: ['internal/protocol', 'internal/transport'],
-    acceptance: 'a message survives being split across TCP reads; a malformed/oversized length prefix is rejected without corrupting the stream; the TLS handshake establishes a pinned (trust-on-first-use) device identity.',
+    id: 'ws2', name: 'WS-2', title: 'Transport (TCP framing over TLS + pinned device identity)',
+    packages: ['internal/transport'],
+    acceptance: 'a message survives being split across TCP reads through the TLS session; a malformed/oversized length drops THAT peer cleanly without desyncing others; TLS 1.3 handshake pins DeviceID (wrong fingerprint rejected before any frame read); no goroutine leak on disconnect and outbound never blocks the select loop (writer-owned, idempotent conn.Close).',
   },
   {
     id: 'ws3', name: 'WS-3', title: 'Discovery (UDP multicast registry)',
     packages: ['internal/discovery'],
-    acceptance: 'a second instance is discovered within the announce interval; a silent peer is evicted after the heartbeat timeout; a rejoining peer is re-discovered.',
+    acceptance: 'a second instance is discovered within the announce interval; a silent peer is evicted after the heartbeat timeout; the registry is race-free under concurrent announce/evict/dial (GR-4 single-goroutine actor); discovery is a hint, never authorisation.',
   },
   {
-    id: 'ws4', name: 'WS-4', title: 'Reconciliation (diff + chunk stream + conflict resolution)',
+    id: 'ws4', name: 'WS-4', title: 'Reconciliation (diff + chunk stream + conflict + tombstone) + cmd/msync wiring',
     packages: ['internal/reconcile', 'cmd/msync', 'test/integration'],
-    acceptance: 'two instances with divergent folders converge to identical root hashes; simultaneous edits to one file produce a .sync-conflict copy with NEITHER version lost; a transfer killed mid-stream leaves no corrupt file (temp discarded, atomic rename); receiving a file does NOT trigger a re-broadcast loop.',
+    acceptance: 'two divergent instances converge to identical roots (at quiescence); simultaneous edits => .sync-conflict copy, neither lost, byte-identical copy name on both peers; killed mid-transfer leaves no corrupt file (verify-after-reconstruct + atomic rename); received file => zero outbound broadcasts; resolver total over Compare x content (concurrent+equal => merge VVs; unknown tombstone => no-op); deletion propagates + no resurrection (ack-gated GC); no-clobber by filesystem verdict; rename = lossless delete+create; REQUEST validated; watcher drops recovered by rescan; bidirectional back-pressure cannot deadlock.',
   },
 ]
 
@@ -333,7 +352,7 @@ if (on(3)) {
   phase('Phase 3 — Design critique')
   const perCritic = await pipeline(
     CRITICS,
-    ([slug, focus]) => agent(P(`You are ${slug} (Phase 3 design critic). Reads first: all docs/audit/rules/, docs/audit/plan/structure.md, docs/audit/findings/synthesis/, and the Phase 2 findings.
+    ([slug, focus]) => agent(P(`You are ${slug} (Phase 3 design critic). Reads first: all docs/audit/rules/, docs/audit/plan/structure.md, docs/audit/findings/synthesis/, and the Phase 2 findings. If docs/audit/decisions/STEERING.md exists, also read it — human-in-the-loop hardening priors; treat them as strong defaults you MAY still challenge with cited evidence.
 Adversarially critique the DESIGN (not yet the code) for: ${focus}
 Write each finding as its own file docs/audit/findings/design/${slug}/<id>.md with YAML front-matter (id, title, severity, status: open) + Claim / Evidence / Impact / Recommended-change. Be specific and evidence-backed — a finding that just says "be careful" is worthless. Quality over quantity (aim 2-4 strongest).
 Return FINDINGS with id like "${slug}-1".`), { label: `critic:${slug}`, phase: 'Phase 3 — Design critique', schema: FINDINGS })
@@ -366,7 +385,7 @@ Return MANIFEST.`), { label: 'design-consolidator', phase: 'Phase 3 — Design c
 // ----------------------------------------------------------------------------
 if (on(4)) {
   phase('Phase 4 — Plan')
-  await agent(P(`You are the planner (Phase 4). Reads first: docs/audit/findings/design/consolidated/overview.md, synthesis, the Phase 2 findings, docs/audit/plan/structure.md.
+  await agent(P(`You are the planner (Phase 4). Reads first: docs/audit/findings/design/consolidated/overview.md, synthesis, the Phase 2 findings, docs/audit/plan/structure.md, and docs/audit/decisions/STEERING.md if present (human-in-the-loop hardening priors).
 Write docs/audit/plan/implementation-plan.md with ordered workstreams whose ACCEPTANCE CRITERIA are phrased as sync invariants:
 - WS-1 Merkle tree + scanner + pathnorm. Accept: same folder scanned twice => identical root hash; pathnorm round-trips a Windows-hostile name set without loss; one byte changed => root hash changes and exactly that leaf's branch.
 - WS-2 Transport (TCP framing + TLS). Accept: a message survives being split across TCP reads; a malformed/oversized length is rejected without corrupting the stream; TLS handshake pins a device identity.
@@ -382,7 +401,9 @@ Return PLAN.`), { label: 'planner', phase: 'Phase 4 — Plan', schema: PLAN })
 let buildResult = null
 if (on(5)) {
   phase('Phase 5 — Implementation')
-  for (const ws of WORKSTREAMS) {
+  const wsToRun = WORKSTREAMS.filter((w) => !WS_FILTER || WS_FILTER.includes(w.id))
+  log(`Phase 5 implementing: ${wsToRun.map((w) => w.id).join(', ')}`)
+  for (const ws of wsToRun) {
     await agent(PG(`You are the implementer for ${ws.name} — ${ws.title} (Phase 5). You are the ONLY agent running now (single working tree), so git is safe.
 Reads first: .claude/skills/merkle-sync/SKILL.md, all docs/audit/rules/, the ${ws.name} section of docs/audit/plan/implementation-plan.md, the verified decisions in docs/audit/findings/design/consolidated/overview.md, and the relevant Phase 2 findings (name the finding ids you use).
 Target packages: ${ws.packages.join(', ')}. Module path: ${MODULE}.
@@ -478,7 +499,7 @@ if (DO_FINAL) {
 Return MANIFEST.`), { label: 'summary', phase: 'Final — Summary & PR', schema: MANIFEST })
 
   await agent(PG(`You are the PR agent (Final).
-1) Ensure everything is committed: 'git add -A' then commit any remaining audit files with 'docs(audit): final audit trail + summary' (skip if nothing to commit).
+1) Ensure everything is committed EXCEPT the orchestrator-managed workflow script: stage with 'git add docs .github .claude CLAUDE.md internal cmd test go.mod go.sum' (do NOT run 'git add -A', and never stage plan/merkle-sync.workflow.js), then commit any staged files with 'docs(audit): final audit trail + summary' (skip if nothing staged).
 2) Check 'git remote -v'. ${HAS_REMOTE ? 'A remote URL was provided: push the branch and run gh pr create with a body summarising the build + linking docs/audit/SUMMARY.md, ending with the Claude Code footer.' : 'NO remote was provided: do NOT push or open a PR. Just report the local branch name and the exact commands a human would run to push + open a PR.'}
 Return MANIFEST (summary = branch state + PR url or 'local only').`), { label: 'pr', phase: 'Final — Summary & PR', schema: MANIFEST })
 }
