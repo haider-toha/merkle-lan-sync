@@ -3,17 +3,34 @@
 - Phase / role: Phase 2 — protocol-researcher
 - Severity: **medium** (correctness is fine either way; the difference is transfer
   efficiency — a naive scheme re-sends the whole file on a rename — not data loss)
-- Status: **fixed** (WS-4) — v1 rename is the emergent delete+create: the scanner
-  synthesizes a tombstone for the old path and a create for the new, the broadcast
-  orders creates-before-deletes (`broadcast.go` `orderCreatesBeforeDeletes`), and the
-  puller's local content-addressed reuse (`transfer.go` `localSource`) makes the new
-  path cost ZERO network when the bytes are still local. Verified by
-  `reconcile_test.go` `TestRename_NoNetworkTransfer` +
-  `TestRescan_DetectsRenameAsDeleteCreate`. Decision
-  `docs/audit/decisions/ws4/tombstone-lifecycle-rename-and-no-clobber.md`. Commit
-  `af12de099165f38e11556555acc986b9ba385f24`. **Binding decision owner =
-  merkle-researcher (synthesis OQ-7)**; this finding contributed the protocol-layer
-  analysis and the chosen v1 approach matches it (no new wire type; `MOVE` deferred).
+- Status: **fixed** (WS-4 + Phase 7) — v1 rename is the emergent delete+create: the
+  scanner synthesizes a tombstone for the old path and a create for the new, and the
+  puller's local content-addressed reuse (`transfer.go` `localSource`) makes the new path
+  cost ZERO network when the bytes are still local. **Phase 6 REFUTED the "fixed" verdict**
+  (both skeptics, `docs/audit/findings/review/PR-5-skeptic1.md`,
+  `.../votes/PR-5-skeptic2.md`): the zero-network claim held only in the synthetic
+  `TestRename_NoNetworkTransfer` (a direct `materialise` that keeps the old file alive),
+  NOT on the real receiver path, where `merkle.Diff` is path-sorted (not creates-before-
+  deletes) and a tombstone's `os.Remove` is synchronous while the create's fetch is async —
+  so the old file was removed before the create could reuse it, forcing a network fetch
+  (deterministically for new-sorts-after-old, e.g. `a.txt`→`z.txt`; racily otherwise).
+  `orderCreatesBeforeDeletes` (wire-only) did not survive to apply time.
+  **Phase 7 round 1 fix (this update):** `reconcileWithPeer` now PAIRS a create with a
+  same-`content_hash` tombstone whose old bytes are still local and enqueues ONE COUPLED
+  puller task (reusing the PR-3 preserve→applyTomb machinery): the create is materialised
+  FIRST (reusing the still-present old file via `localSource` — zero network) and the old
+  tombstone's destructive `os.Remove` is DEFERRED until after the copy lands — making the
+  optimisation ORDER-INDEPENDENT. Proven on the real receiver path by
+  `reconcile_test.go` `TestRename_CrossPeer_ZeroNetwork_OrderIndependent` (asserts
+  `MsgRequest == 0` for `a→z`, `z→a`, and a Windows-hostile reserved-stem key pair) plus
+  end-to-end `test/integration` `TestRename_AfterSortingOrder_PropagatesNoLoss`;
+  `TestRename_NoNetworkTransfer` / `TestRescan_DetectsRenameAsDeleteCreate` retained.
+  Decisions `docs/audit/decisions/ws4/tombstone-lifecycle-rename-and-no-clobber.md`,
+  `docs/audit/decisions/phase7/PR-5-rename-zero-network-order-independence.md`. Commits
+  `af12de099165f38e11556555acc986b9ba385f24` (WS-4), `88d93b22fa437b7e776bd50ebddbfa5a4506571a` (Phase 7).
+  **Binding decision owner = merkle-researcher (synthesis OQ-7)**; this finding contributed
+  the protocol-layer analysis and the chosen v1 approach matches it (no new wire type;
+  `MOVE` deferred).
 - Reads-first honoured: `findings/synthesis/problem-space-map.md` OQ-7,
   `findings/literature/rsync-algorithm.md` §9.5, `findings/literature/merkle-tree.md` §4.6,
   `findings/literature/syncthing-bep.md` §7.
@@ -97,9 +114,15 @@ hash-match detection later") and keeps the catalogue at seven types.
 
 1. Rename a file on A → B ends with the file at the new path and a tombstone at the old;
    roots converge; **zero network transfer** when the bytes are still local (assert no
-   `REQUEST` for that content_hash).
+   `REQUEST` for that content_hash). **MET (Phase 7):**
+   `reconcile_test.go TestRename_CrossPeer_ZeroNetwork_OrderIndependent` asserts
+   `MsgRequest == 0` on the real receiver apply path for `a→z`, `z→a`, and a
+   Windows-hostile key pair; `test/integration TestRename_AfterSortingOrder_PropagatesNoLoss`
+   adds end-to-end convergence + no-loss for the previously-mishandled sort order.
 2. Create-before-delete ordering: assert the new path is never transiently absent on B
-   in a way that loses the only copy.
+   in a way that loses the only copy. **MET:** the Phase 7 coupling makes the receiver
+   reuse-then-remove (the new bytes land before the old's removal) regardless of the wire
+   or diff order — `TestRename_PropagatesNoLoss` + the order-independent unit test above.
 3. (If hash-match is later built) duplicate-content false-match guard: two unrelated
    identical files are not mis-detected as a rename in a way that loses one.
 
