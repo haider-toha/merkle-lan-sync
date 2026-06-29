@@ -123,7 +123,7 @@ and `ParseDeviceID`. Tests (`deviceid_test.go`, green under `-race`):
 
 ## Implementation status (WS-2 — complete)
 
-**Landed in WS-2** — commit `<WS2-COMMIT-SHA>` on branch `feat/merkle-sync-engine`
+**Landed in WS-2** — commit `31ef9c6e4b9f7e25fc72e776b64d6795cd81a9bb` on branch `feat/merkle-sync-engine`
 (`internal/transport/{identity.go, tls.go, conn.go, transport.go, listener.go,
 dial.go, doc.go}`): all of the previously-remaining §4 hardening + §5 TOFU allow-list
 + §7 obligations 1–3.

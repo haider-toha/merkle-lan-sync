@@ -240,7 +240,7 @@ Key protocol invariants surfaced by the state machine:
   including split-read survival (`iotest.OneByteReader`), oversized/zero rejection with
   no body read, the `MaxChunkLen` boundary, and skip-unknown-frame-then-continue.
 
-**Landed in WS-2** — commit `<WS2-COMMIT-SHA>` on branch `feat/merkle-sync-engine`
+**Landed in WS-2** — commit `31ef9c6e4b9f7e25fc72e776b64d6795cd81a9bb` on branch `feat/merkle-sync-engine`
 (`internal/transport/{transport.go, listener.go, dial.go, conn.go}`): §5 the
 connection lifecycle / handshake state machine — steps 1–2 (TLS 1.3 pin in
 `VerifyConnection` → recompute pinned DeviceID → in-band HELLO exchange that
