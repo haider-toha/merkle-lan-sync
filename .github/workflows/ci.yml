@@ -1,6 +1,12 @@
-# Cross-platform CI matrix — this is the artifact that closes the OS gap the
-# README calls out: the suite runs on a real windows-latest runner, not just
-# the Mac it was written on. Phase 6 (evidence-generator) refines this file.
+# Cross-platform CI matrix — this is the artifact that closes the OS gap the README
+# calls out: the full -race suite (including the two-instance integration scenarios in
+# test/integration) runs on a real windows-latest runner, not just the Mac it was
+# written on. Phase 6 (evidence-generator) refined this file; see
+# docs/audit/decisions/phase6/ci-matrix-and-checklist.md. "Green here" is necessary but
+# NOT sufficient — the genuinely-manual cross-OS steps live in
+# docs/audit/CROSS_PLATFORM_CHECKLIST.md (NTFS case collisions, reserved names, NFD/NFC,
+# firewall/multicast, ReadDirectoryChangesW overflow), which a human runs once against a
+# real Windows box on the same LAN.
 name: ci
 
 on:
@@ -12,10 +18,15 @@ permissions:
   contents: read
 
 jobs:
+  # Build + vet + the full data-race suite on all three OSes. The windows-latest leg is
+  # the OS-gap closer: it runs the same loopback two-node convergence / conflict /
+  # deletion / rename / killed-transfer / large-file scenarios on Windows. -shuffle=on
+  # surfaces any hidden test-order coupling; the Go version is pinned to go.mod so CI
+  # and local builds never drift.
   test:
     name: build+test (${{ matrix.os }})
     strategy:
-      fail-fast: false
+      fail-fast: false # one OS failing must not hide the others
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -23,15 +34,38 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
           cache: true
       - name: Build
         run: go build ./...
       - name: Vet
         run: go vet ./...
-      - name: Test (race)
-        run: go test ./... -race -count=1
+      - name: Test (race, shuffled)
+        run: go test ./... -race -shuffle=on -count=1
 
+  # Formatting drift is OS-independent, so check it once on Linux (also avoids
+  # cross-shell scripting on the Windows runner). Fails if any file is not gofmt-clean.
+  lint:
+    name: gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt drift check
+        run: |
+          drift="$(gofmt -l .)"
+          if [ -n "$drift" ]; then
+            echo "::error::gofmt drift in the following files (run 'gofmt -w .'):"
+            echo "$drift"
+            exit 1
+          fi
+          echo "gofmt: clean"
+
+  # Fast, early "does Windows still build" signal — independent of the (slower,
+  # heavily-shared) windows-latest test leg. Mirrors the local
+  # `GOOS=windows GOARCH=amd64 go build ./cmd/msync` gate.
   cross-compile:
     name: cross-compile windows/amd64
     runs-on: ubuntu-latest
@@ -39,7 +73,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
+          cache: true
       - name: GOOS=windows build
         env:
           GOOS: windows
