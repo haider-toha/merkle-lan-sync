@@ -215,6 +215,13 @@ regression:
   engine per-peer map return to baseline; a two-instance bidirectional back-pressure test
   (small socket buffers, simultaneous large transfers) asserting convergence within a
   timeout (a hang = the deadlock).
+- **WS-3 discharge (2026-06-29, commit `fd36e70`):** the discovery `-race` test
+  obligation above is implemented. `internal/discovery` is a GR-4 single-goroutine
+  registry actor (no shared-lock map; non-tree state owned by the actor, GR-5
+  unaffected), and `discovery_test.go` `TestDiscovery_RaceAnnounceEvictDial` runs
+  announce + eviction + a dial consumer concurrently, green under `-race`. The
+  reconcile/transport `-race`, churn-leak, and back-pressure items in this bullet
+  remain WS-2/WS-4 obligations.
 
 ### CDD-2 — Pin the framing size budget and validate REQUEST (WS-2 transport, WS-4 reconcile)
 *Severity: low/medium (hardening). Source: protocol-critic-1.*

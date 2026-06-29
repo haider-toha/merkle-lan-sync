@@ -7,6 +7,16 @@ status: rejected
 
 # concurrency-critic-1 — The `RWMutex` "guards the tree" boundary is incomplete; other shared mutable state has no documented owner
 
+> **Implementation status (WS-3, 2026-06-29, commit `fd36e70`).** Verdict unchanged
+> (`rejected`: the skeptics affirmed the GR-4 single-goroutine-actor design already
+> precludes the alleged registry race — "the finding's preferred fix *is* the
+> documented design"). That design is now realised in code: `internal/discovery`
+> owns its peer map in one actor goroutine (no lock, no shared map; producers reach
+> it only via channels), and `discovery_test.go`
+> `TestDiscovery_RaceAnnounceEvictDial` proves it race-free under concurrent
+> announce + eviction + dial. The CDD-1 discovery `-race` obligation is discharged
+> for WS-3 (see `findings/design/consolidated/overview.md` CDD-1).
+
 ## Claim
 
 GR-5 and `structure.md` define exactly **one** synchronisation primitive for the
