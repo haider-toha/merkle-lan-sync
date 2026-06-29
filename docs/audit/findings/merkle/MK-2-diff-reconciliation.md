@@ -2,11 +2,19 @@
 
 - Slug: `MK-2-diff-reconciliation`
 - Phase / role: Phase 2 — merkle-researcher
-- Status: **fixed** (WS-1) — the prune-equal/recurse-mismatching differ is
-  implemented in `internal/merkle/differ.go` with the "absence is ambiguous →
+- Status: **fixed** (WS-1 + Phase 7 round 1) — the prune-equal/recurse-mismatching
+  differ is implemented in `internal/merkle/differ.go` with the "absence is ambiguous →
   single-sided candidate" rule and a white-box prune assertion test; the VV/tombstone
   resolver that consumes it stays in `internal/reconcile` (WS-4). Decision
-  `docs/audit/decisions/ws1/tree-representation-and-differ.md`. Commit `182ff00a16868df05377cb3585b914aa1d59784e`.
+  `docs/audit/decisions/ws1/tree-representation-and-differ.md`. WS-1 commit
+  `182ff00a16868df05377cb3585b914aa1d59784e`.
+  The WS-1 "fixed" verdict was **refuted** by two Phase 6 skeptics
+  (`docs/audit/findings/review/votes/MK-2-skeptic1.md`, `MK-2-skeptic2.md`): the
+  file-vs-directory branch was untested AND emitted a **false** absence (`Remote=nil`
+  over a path the remote held as a directory), which livelocked WS-4 on an impossible
+  `mkdir`/`rename`. That gap is **closed in Phase 7 round 1**, commit
+  `0e8df56665659fd7fc20b497e3ae47a9b10c1df2` — see "Phase 7 resolution" below.
+  Decision `docs/audit/decisions/phase7/MK-2-file-vs-dir-typeclash-resolution.md`.
 - Severity: **medium** (foundational to SR-5; two correctness subtleties — "absence
   is ambiguous" and the honest complexity bound — are easy to get wrong)
 - Date / access date for all URLs: 2026-06-28
@@ -105,3 +113,47 @@ SKILL §3, SR-4):
   but never lossy). Revisit only if spurious conflict copies are measured.
 - **Cross-refs:** SR-3/4/5/7/9/10, GR-5; AL-2; literature `merkle-tree`,
   `version-vectors`, `syncthing-bep`.
+
+## Phase 7 resolution — file-vs-directory type clash (round 1)
+
+**The refuted gap.** The WS-1 differ handled a path that is a FILE on one side and a
+DIRECTORY on the other (`differ.go`) by emitting the file as a single-sided candidate
+with the *other* side `nil` and then recursing the directory's children. Reproduced
+this round (throwaway test, removed): local `{foo (file)}` vs remote `{foo/bar.txt}`
+yielded `{Path:"foo", Remote:nil}` (a FALSE "absent" — the remote holds a *directory*
+at `foo`) plus `{Path:"foo/bar.txt", Local:nil}` (an impossible single-sided install).
+This broke the finding's headline "absence is ambiguous" invariant (a nil side must
+mean TRUE absence) and, downstream, livelocked WS-4: the file side retried `mkdir` over
+a file (`ENOTDIR`), the dir side `rename` over a non-empty directory (`EISDIR`), each
+re-reconciling forever, never converging — with no type-clash guard anywhere
+(skeptics #1 and #2, `review/votes/MK-2-skeptic*.md`).
+
+**The fix.** Commit `0e8df56665659fd7fc20b497e3ae47a9b10c1df2`:
+- Differ: `DiffEntry` gains `LocalDir`/`RemoteDir` (+ `IsTypeClash()`). On a file-vs-dir
+  clash the differ emits ONE truthful entry — the file leaf on its side, the `*Dir`
+  flag on the directory side (whose `*FileInfo` stays nil), the other side nil — and
+  **prunes** the directory subtree (no impossible single-sided installs). A nil side now
+  means TRUE absence unless its `*Dir` flag is set: "absence is ambiguous" restored.
+- Engine: new `ErrTypeClash`; `reconcileWithPeer` routes a clash to `flagTypeClash`
+  BEFORE `resolve` — refuse + flag, no fetch enqueued, no completion, no livelock; both
+  peers keep their own data (no loss). Accepted, flagged non-convergence — the same
+  carve-out as the CDD-5 case-clobber refuse. Auto keep-both (directory wins, file →
+  `.sync-conflict` copy, both converge) is the logged forward path
+  (`docs/audit/decisions/phase7/MK-2-file-vs-dir-typeclash-resolution.md`).
+
+**Evidence (all PASS under `-race`).**
+- `internal/merkle/differ_test.go` `TestDiff_FileVsDirTypeClash` — both directions + a
+  multi-file subtree + a canonicalised Windows-hostile clash key; asserts the truthful
+  marker, that the directory side's `*FileInfo` is nil while `IsTypeClash()` is true
+  (not a false absence), the pruned subtree, and the minimal comparison count (root +
+  clash node = 2, proving the subtree is not recursed).
+- `internal/reconcile/reconcile_test.go` `TestReconcile_RefusesFileVsDirTypeClash` —
+  both directions; asserts no fetch enqueued, no completion produced, `ErrTypeClash`
+  flagged with the direction + path, and the local bytes left intact (no data loss).
+- `go build ./...` + `go test ./... -race` green (7 packages);
+  `GOOS=windows GOARCH=amd64 go build ./cmd/msync` clean. Manual cross-OS step added as
+  `docs/audit/CROSS_PLATFORM_CHECKLIST.md` §9.
+
+This answers both refutations: a distinct type-clash marker the engine ACTS on
+(skeptic #2 option (a)) and a tested file-vs-dir branch with proven minimal recursion
+(skeptic #1).
