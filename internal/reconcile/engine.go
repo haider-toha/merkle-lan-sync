@@ -105,9 +105,16 @@ type completion struct {
 // Config configures an Engine. Transport/Discovery/Watcher are optional (nil ⇒ that
 // input is simply absent), so the engine can be unit-driven without the network.
 type Config struct {
-	FolderID         string
-	AbsRoot          string
-	Self             protocol.DeviceID
+	FolderID string
+	AbsRoot  string
+	Self     protocol.DeviceID
+	// Peers is the explicitly-declared set of currently-paired peer DeviceIDs (the
+	// out-of-band TOFU allow-list, PR-7). When non-nil it enables the startup ghost-
+	// counter de-pair sweep (#10590, PR-4): any stored VV counter for a device not in
+	// {Self} ∪ Peers is a de-paired device's ghost and is pruned at load. Nil ⇒ the
+	// paired set is unknown ⇒ retain every counter (the safe fallback). cmd/msync passes
+	// the -peer set; in-process tests that pair dynamically leave it nil.
+	Peers            []protocol.DeviceID
 	SnapshotPath     string
 	RescanInterval   time.Duration
 	SnapshotInterval time.Duration
@@ -150,6 +157,9 @@ type Engine struct {
 	tree     *merkle.Tree
 	expected map[string][32]byte
 	peers    map[protocol.DeviceID]*peerState
+
+	pairedShorts map[protocol.ShortID]bool // {self} ∪ declared peers; gates the de-pair ghost-counter sweep
+	pairedKnown  bool                      // Config.Peers was provided (non-nil) ⇒ the sweep is enabled
 
 	reseed  bool                       // loop-only: cold-start reseed pending
 	dialing map[protocol.DeviceID]bool // loop-only
@@ -211,6 +221,17 @@ func New(cfg Config) (*Engine, error) {
 	if e.logf == nil {
 		e.logf = func(string, ...any) {}
 	}
+	// Record the declared paired set (if any) so startupReconcile can prune the ghost
+	// counters of de-paired devices (#10590, PR-4). Nil Config.Peers ⇒ pairedKnown stays
+	// false ⇒ the sweep is a no-op and every counter is retained (the safe fallback).
+	if cfg.Peers != nil {
+		e.pairedKnown = true
+		e.pairedShorts = make(map[protocol.ShortID]bool, len(cfg.Peers)+1)
+		e.pairedShorts[e.selfShort] = true
+		for _, p := range cfg.Peers {
+			e.pairedShorts[p.Short()] = true
+		}
+	}
 	e.caseSensitive = probeCaseSensitive(absRoot)
 	if err := e.startupReconcile(); err != nil {
 		return nil, err
@@ -239,6 +260,10 @@ func (e *Engine) startupReconcile() error {
 	for _, fi := range merkle.SynthesizeDeletions(prev, cur, e.selfShort) {
 		e.files[fi.Path] = fi
 	}
+	// Prune the ghost counters of any de-paired device before building the tree, so a
+	// removed device's permanent counter can't block tombstone dominance and resurrect a
+	// deletion (#10590 / FM-1, PR-4). No-op unless Config.Peers declared the paired set.
+	e.sweepDepairedCountersLocked()
 	e.reseed = len(prev) == 0
 	e.rebuildLocked()
 	return nil

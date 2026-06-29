@@ -57,13 +57,27 @@ func (e *Engine) gcTombstonesLocked() bool {
 // DropCounter strips a de-paired device's counter from every stored leaf's version
 // vector (copy-on-write) and rebuilds — the ack-gated, device-removal-ONLY pruning
 // that kills the ghost-counter resurrection/conflict-storm class (#10590) without
-// ever touching a live device's history (vv-pruning-counter-cleanup, CDD-7.2). For
-// v1 (2-device, N6) the only trigger is un-pairing the last peer; never time/size.
-// It is the caller's responsibility to only invoke this for an explicitly removed
-// device whose drop the remaining peer has agreed to (symmetric pruning).
+// ever touching a live device's history (vv-pruning-counter-cleanup, CDD-7.2). This
+// exported method is the single-device entry point for an EXPLICIT device removal; the
+// startup de-pair sweep (sweepDepairedCountersLocked) shares its copy-on-write core.
+// For v1 (2-device, N6) the wired trigger is the between-runs -peer change picked up by
+// the startup sweep; a runtime hot un-pair is the documented deferred path
+// (decisions/phase7/PR-4-ghost-counter-wiring-and-test-obligations.md). It is the
+// caller's responsibility to only invoke this for an explicitly removed device whose
+// drop the remaining peer has agreed to (symmetric pruning).
 func (e *Engine) DropCounter(id protocol.ShortID) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.dropCounterLocked(id) {
+		e.rebuildLocked()
+	}
+}
+
+// dropCounterLocked strips id's counter from every stored leaf's VV (copy-on-write)
+// and reports whether anything changed. It does NOT rebuild — the caller rebuilds once
+// so a multi-device sweep pays a single tree rebuild. Caller holds e.mu (write) OR is
+// the single-goroutine New path. Shared by DropCounter and sweepDepairedCountersLocked.
+func (e *Engine) dropCounterLocked(id protocol.ShortID) bool {
 	changed := false
 	for path, fi := range e.files {
 		nv := dropFromVV(fi.Version, id)
@@ -73,9 +87,45 @@ func (e *Engine) DropCounter(id protocol.ShortID) {
 			changed = true
 		}
 	}
-	if changed {
-		e.rebuildLocked()
+	return changed
+}
+
+// sweepDepairedCountersLocked removes, from every stored leaf's VV, the counter of any
+// device that is neither self nor in the explicitly-declared paired set — i.e. a device
+// the operator has DE-PAIRED (removed from the allow-list). This is the ack-gated,
+// device-removal-ONLY ghost-counter prune (#10590 / FM-1): a de-paired device's counter
+// is otherwise permanent, and once two live devices' histories differ on it NEITHER
+// vector can dominate ⇒ a tombstone fails to win ⇒ the deleted file resurrects (as a
+// clean copy or a conflict storm — the #10590 symptom). It runs ONLY when the paired set
+// is KNOWN (Config.Peers != nil ⇒ pairedKnown); otherwise every counter is retained (the
+// safe fallback, mirroring tombstone GC's retain-when-no-peer — never prune a counter we
+// cannot prove is dead). By construction it never drops a live/paired device's counter,
+// so SR-10 dominance among live devices is preserved (vv-pruning-counter-cleanup,
+// Option A). Caller holds e.mu (write) OR is the single-goroutine New path; the caller
+// rebuilds. Returns true if anything changed.
+func (e *Engine) sweepDepairedCountersLocked() bool {
+	if !e.pairedKnown {
+		return false
 	}
+	// Collect the distinct de-paired device shorts present anywhere, then drop each over
+	// all leaves (dead devices are rare and few; one pass per dead device).
+	var dead []protocol.ShortID
+	seen := make(map[protocol.ShortID]bool)
+	for _, fi := range e.files {
+		for _, c := range fi.Version {
+			if !e.pairedShorts[c.ID] && !seen[c.ID] {
+				seen[c.ID] = true
+				dead = append(dead, c.ID)
+			}
+		}
+	}
+	changed := false
+	for _, id := range dead {
+		if e.dropCounterLocked(id) {
+			changed = true
+		}
+	}
+	return changed
 }
 
 // dropFromVV returns a copy of vv with id's counter removed (copy-on-write; the

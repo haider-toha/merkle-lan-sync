@@ -1226,6 +1226,221 @@ func TestDropFromVV(t *testing.T) {
 	}
 }
 
+// ---------- PR-4: ghost-counter (#10590) de-pair prune — wiring + load-bearing proof ----------
+
+// TestDropCounter_SweepsAllLeavesAndRebuilds exercises the EXPORTED DropCounter method
+// (lock + copy-on-write + rebuild), which skeptic #1/#2 noted had no test of its own
+// (only the private dropFromVV helper). It must strip the dropped device's counter from
+// EVERY leaf (live + tombstone), never touch a live device's counter, and rebuild the
+// tree (the root changes). Runs under -race like the rest of the suite (COW safety).
+func TestDropCounter_SweepsAllLeavesAndRebuilds(t *testing.T) {
+	e := tempEngine(t)
+	const ghost = protocol.ShortID(3) // a de-paired device's ghost counter
+	e.mu.Lock()
+	e.files["a.txt"] = liveFI("a.txt", "x", 1, vv(uint64(e.selfShort), 2, uint64(ghost), 5))
+	e.files["b.txt"] = tombFI("b.txt", 1, vv(uint64(e.selfShort), 4, uint64(ghost), 9))
+	e.files["c.txt"] = liveFI("c.txt", "y", 1, vv(uint64(e.selfShort), 1)) // no ghost counter
+	e.rebuildLocked()
+	e.mu.Unlock()
+	before := e.RootHash()
+
+	e.DropCounter(ghost)
+
+	after := e.RootHash()
+	if after == before {
+		t.Fatal("DropCounter must rebuild the tree — the root should change after pruning")
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for path, fi := range e.files {
+		if fi.Version.Get(ghost) != 0 {
+			t.Fatalf("%s still carries the dropped counter: %v", path, fi.Version)
+		}
+	}
+	if e.files["a.txt"].Version.Get(e.selfShort) != 2 || e.files["b.txt"].Version.Get(e.selfShort) != 4 {
+		t.Fatalf("DropCounter touched a live device's counter: a=%v b=%v",
+			e.files["a.txt"].Version, e.files["b.txt"].Version)
+	}
+}
+
+// TestSweepDepairedCounters checks the startup sweep helper directly: with a KNOWN paired
+// set it prunes only the counters of devices NOT in {self} ∪ paired (de-paired ghosts),
+// leaves live counters intact, collapses a leaf whose sole author was de-paired to a
+// canonical empty VV, and — the safe fallback — is a NO-OP when the paired set is unknown
+// (pairedKnown=false ⇒ retain every counter, never prune what we can't prove is dead).
+func TestSweepDepairedCounters(t *testing.T) {
+	e := tempEngine(t)
+	peer := protocol.ShortID(0xABCD)
+	ghost := protocol.ShortID(0xBEEF)
+	e.pairedKnown = true
+	e.pairedShorts = map[protocol.ShortID]bool{e.selfShort: true, peer: true}
+
+	e.mu.Lock()
+	e.files["a.txt"] = liveFI("a.txt", "x", 1, vv(uint64(e.selfShort), 1, uint64(peer), 2, uint64(ghost), 9))
+	e.files["b.txt"] = tombFI("b.txt", 1, vv(uint64(ghost), 3)) // sole author was the de-paired device
+	changed := e.sweepDepairedCountersLocked()
+	e.mu.Unlock()
+	if !changed {
+		t.Fatal("sweep should report a change")
+	}
+	if g := e.files["a.txt"].Version; g.Get(ghost) != 0 || g.Get(e.selfShort) != 1 || g.Get(peer) != 2 {
+		t.Fatalf("a.txt: ghost not pruned or a live counter touched: %v", g)
+	}
+	if g := e.files["b.txt"].Version; len(g) != 0 {
+		t.Fatalf("b.txt: dropping the sole (ghost) counter must yield a canonical empty VV, got %v", g)
+	}
+
+	// Safe fallback: with pairedKnown=false the sweep retains every counter.
+	e.pairedKnown = false
+	e.mu.Lock()
+	e.files["c.txt"] = liveFI("c.txt", "z", 1, vv(uint64(ghost), 1))
+	again := e.sweepDepairedCountersLocked()
+	e.mu.Unlock()
+	if again {
+		t.Fatal("sweep must be a no-op when the paired set is unknown (retain-all fallback)")
+	}
+	if e.files["c.txt"].Version.Get(ghost) != 1 {
+		t.Fatal("retain-all fallback must keep the counter when pairedKnown is false")
+	}
+}
+
+// TestGhostCounter_ResurrectionPreventedByDrop is the LOAD-BEARING proof the skeptics
+// demanded for the #10590 mitigation: it shows the prune is doing real work. With a
+// de-paired device's ghost counter still present, a deleter's tombstone and a still-paired
+// peer's pre-delete version diverge on that dead counter ⇒ NEITHER vector dominates ⇒ the
+// resolver returns a CONFLICT on both sides (the deletion fails to win — the deleted file
+// "resurrects" as a sync-conflict copy, the exact #10590 symptom). After the de-paired
+// counter is dropped from BOTH vectors, the tombstone cleanly DOMINATES ⇒ the deleter
+// keeps it (NoOp) and the stale peer APPLIES the delete (Install tombstone) — no
+// resurrection. Devices: 1 = deleter/self, 2 = still-paired peer, 3 = DE-PAIRED (ghost).
+func TestGhostCounter_ResurrectionPreventedByDrop(t *testing.T) {
+	const self, peer, removed = protocol.ShortID(1), protocol.ShortID(2), protocol.ShortID(3)
+
+	// Tomb carries the deleter's bump (1:2) AND the dead device's counter (3:5); the
+	// stale peer holds a pre-delete version with MORE of the dead device's history (3:7).
+	tomb := tombFI("f.txt", 10, vv(uint64(self), 2, uint64(removed), 5))
+	stale := liveFI("f.txt", "old", 20, vv(uint64(self), 1, uint64(removed), 7))
+
+	// WITH the ghost counter: neither dominates ⇒ resurrection-as-conflict on BOTH sides.
+	if p := resolve(&tomb, &stale, self); p.kind != planConflict {
+		t.Fatalf("ghost counter must break clean dominance ⇒ planConflict (resurrection), got %v", p.kind)
+	}
+	if p := resolve(&stale, &tomb, peer); p.kind != planConflict {
+		t.Fatalf("stale peer must see a conflict (file resurrected as a copy), got %v", p.kind)
+	}
+
+	// AFTER the symmetric de-pair prune (drop device 3 from both):
+	tombP, staleP := tomb, stale
+	tombP.Version = dropFromVV(tomb.Version, removed)   // {1:2}
+	staleP.Version = dropFromVV(stale.Version, removed) // {1:1}
+	if p := resolve(&tombP, &staleP, self); p.kind != planNoOp {
+		t.Fatalf("after drop, the deleter keeps the dominating tombstone ⇒ planNoOp, got %v", p.kind)
+	}
+	p := resolve(&staleP, &tombP, peer)
+	if p.kind != planInstall || !p.install.Deleted {
+		t.Fatalf("after drop, the stale peer must APPLY the tombstone (clean delete, no resurrection), got %v deleted=%v", p.kind, p.install.Deleted)
+	}
+}
+
+// TestEngine_StartupSweepsDepairedGhostCounter proves the prune is WIRED into the binary's
+// real load path: New ⇒ startupReconcile ⇒ sweepDepairedCountersLocked. A crafted snapshot
+// carries a leaf whose VV holds self + a still-paired peer + a de-paired device's counter.
+// Constructing the engine with Config.Peers listing only the still-paired peer sweeps the
+// de-paired counter at startup; constructing with nil Peers retains every counter (the
+// safe fallback). This is the device-removal trigger the vv-pruning-counter-cleanup
+// decision mandates, expressed as a between-runs -peer change.
+func TestEngine_StartupSweepsDepairedGhostCounter(t *testing.T) {
+	self, peer, removed := devID(0x10), devID(0x20), devID(0x30)
+	selfS, peerS, removedS := self.Short(), peer.Short(), removed.Short()
+
+	craft := func(t *testing.T) (dir, snap string) {
+		t.Helper()
+		dir = t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		snap = filepath.Join(t.TempDir(), "snap.gob")
+		leaf := merkle.FileInfo{
+			Path:        "f.txt",
+			ContentHash: merkle.HashBytes([]byte("data")), // == HashFile of the on-disk "data" ⇒ restoreVVs keeps the VV
+			Size:        4,
+			Mode:        0o644,
+			ModTimeNS:   1,
+			Type:        merkle.TypeFile,
+			Version:     vv(uint64(selfS), 2, uint64(peerS), 3, uint64(removedS), 5),
+		}
+		if err := merkle.SaveSnapshot(snap, []merkle.FileInfo{leaf}); err != nil {
+			t.Fatal(err)
+		}
+		return dir, snap
+	}
+
+	// Peers declared (peer still paired, removed NOT) ⇒ the de-paired ghost is swept.
+	dir, snap := craft(t)
+	e, err := New(Config{
+		FolderID: "t", AbsRoot: dir, Self: self,
+		Peers:        []protocol.DeviceID{peer},
+		SnapshotPath: snap, RescanInterval: time.Hour, RequestTimeout: time.Second, Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	got := fileVersion(t, e, "f.txt")
+	if got.Get(removedS) != 0 {
+		t.Fatalf("de-paired device's ghost counter not swept at startup: %v", got)
+	}
+	if got.Get(selfS) != 2 || got.Get(peerS) != 3 {
+		t.Fatalf("startup sweep touched a live device's counter: %v", got)
+	}
+
+	// Nil Peers ⇒ the paired set is unknown ⇒ retain every counter (safe fallback).
+	dir2, snap2 := craft(t)
+	e2, err := New(Config{
+		FolderID: "t", AbsRoot: dir2, Self: self,
+		SnapshotPath: snap2, RescanInterval: time.Hour, RequestTimeout: time.Second, Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("New (nil peers): %v", err)
+	}
+	if g := fileVersion(t, e2, "f.txt"); g.Get(removedS) != 5 {
+		t.Fatalf("nil-Peers fallback must retain every counter, got %v", g)
+	}
+}
+
+// fileVersion returns the stored version vector for key from the engine's snapshot.
+func fileVersion(t *testing.T, e *Engine, key string) protocol.VersionVector {
+	t.Helper()
+	for _, fi := range e.Snapshot() {
+		if fi.Path == key {
+			return fi.Version
+		}
+	}
+	t.Fatalf("file %q not present in engine snapshot", key)
+	return nil
+}
+
+// TestResolver_ModifyWinsKeepsLiveFile completes obligation #4 coverage (the delete-wins
+// direction is TestResolver_DeleteWinsPreservesModification): the OTHER direction of a
+// concurrent delete-vs-modification, where the live modification has the newer mtime and
+// WINS. The winner is the live file kept at the path; the losing TOMBSTONE yields no copy
+// (no bytes to preserve). No data loss either way (SR-7/SR-9) — the mtime tiebreak is
+// lossless in both directions; a deterministic modify-wins policy is a possible future
+// refinement, not a data-loss bug.
+func TestResolver_ModifyWinsKeepsLiveFile(t *testing.T) {
+	mod := liveFI("f.txt", "edited", 100, vv(1, 1)) // live modification, HIGH mtime ⇒ wins
+	tomb := tombFI("f.txt", 1, vv(2, 1))            // deletion, LOW mtime ⇒ loses
+	p := resolve(&mod, &tomb, 1)
+	if p.kind != planConflict {
+		t.Fatalf("delete-vs-modify must conflict (keep both), got %v", p.kind)
+	}
+	if p.winner.Deleted {
+		t.Fatalf("with a higher modification mtime the MODIFY must win; winner=%+v", p.winner)
+	}
+	if p.loser != nil {
+		t.Fatalf("a losing TOMBSTONE has no bytes ⇒ no conflict copy, got loser=%v", p.loser)
+	}
+}
+
 // ---------- case-sensitivity probe sanity ----------
 
 func TestProbeCaseSensitive_NoPanicAndConsistent(t *testing.T) {

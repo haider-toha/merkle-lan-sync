@@ -80,12 +80,18 @@ func run(dir string, port int, folderID, configDir string, peerIDs []string) err
 	// Out-of-band paired allow-list (PR-7 TOFU). Trusting our own id is harmless and
 	// lets a same-host two-instance demo connect.
 	allow := transport.NewAllowlist(id.DeviceID)
+	// pairedPeers stays nil unless at least one -peer is given. A declared (non-nil) set
+	// enables the engine's startup de-pair ghost-counter sweep (#10590, PR-4): a counter
+	// for a device no longer in this set is pruned. Leaving it nil for a solo run retains
+	// every counter (the safe fallback — never prune a counter we can't prove is dead).
+	var pairedPeers []protocol.DeviceID
 	for _, p := range peerIDs {
 		did, perr := protocol.ParseDeviceID(strings.TrimSpace(p))
 		if perr != nil {
 			return fmt.Errorf("invalid -peer %q: %w", p, perr)
 		}
 		allow.Add(did)
+		pairedPeers = append(pairedPeers, did)
 		log.Printf("paired peer: %s", did)
 	}
 
@@ -111,6 +117,7 @@ func run(dir string, port int, folderID, configDir string, peerIDs []string) err
 		FolderID:      folderID,
 		AbsRoot:       absDir,
 		Self:          id.DeviceID,
+		Peers:         pairedPeers,
 		SnapshotPath:  filepath.Join(configDir, "snapshot.gob"),
 		Transport:     tp,
 		Discovery:     disco,

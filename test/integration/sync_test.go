@@ -212,6 +212,56 @@ func TestRestart_SynthesizesDeletionFromSnapshot(t *testing.T) {
 	}
 }
 
+// PR-4 obligation #5 (skeptic #2 §2): a NOT-YET-ACKED tombstone — authored while running,
+// retained because no peer has acknowledged it, persisted to the snapshot, then RELOADED
+// unchanged at restart — must survive the restart and still dominate a stale peer through
+// the full reconcile/broadcast path, with no resurrection. This is distinct from
+// TestRestart_SynthesizesDeletionFromSnapshot, which mints a FRESH tombstone at restart
+// from a delete-while-down: here the tombstone already exists in the snapshot and is
+// carried forward by SynthesizeDeletions, exercising the "snapshot stores tombstones so a
+// restart doesn't forget a not-yet-acked deletion" path end-to-end (finding §7, OQ-5).
+func TestRestart_PendingTombstoneSurvivesAndNoResurrection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dirA, dirB := t.TempDir(), t.TempDir()
+	write(t, dirA, "doomed.txt", "data") // A authors it; B will RECEIVE it (so B descends from A {A:1})
+
+	a := startNode(t, ctx, dirA)
+	b := startNode(t, ctx, dirB)
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+	if _, ok := read(t, b.dir, "doomed.txt"); !ok {
+		t.Fatal("precondition: B should have received doomed.txt before the delete (so it is a true stale pre-delete holder)")
+	}
+
+	// Stop B FIRST so A deletes with NO peer connected ⇒ the tombstone is RETAINED
+	// (canGC keeps it when no peer is known) — i.e. it stays a not-yet-acked pending delete.
+	stop(t, b)
+	withFile := a.eng.RootHash()
+	if err := os.Remove(filepath.Join(dirA, "doomed.txt")); err != nil {
+		t.Fatal(err)
+	}
+	waitRootChanged(t, a, withFile, budgetAuthor) // A's rescan tombstones it {A:2}; retained (no peer)
+
+	// Stop A: its shutdown persists the snapshot CONTAINING the pending (un-acked) tombstone.
+	stop(t, a)
+
+	// Restart BOTH over the same folders/identities/snapshots. A loads the pending tombstone
+	// (SynthesizeDeletions carries it forward unchanged); B loads the stale live doomed.txt {A:1}.
+	a = restartNode(t, ctx, a)
+	b = restartNode(t, ctx, b)
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+
+	if _, ok := read(t, a.dir, "doomed.txt"); ok {
+		t.Fatal("pending tombstone did not survive the restart — file resurrected on the deleter A")
+	}
+	if _, ok := read(t, b.dir, "doomed.txt"); ok {
+		t.Fatal("stale peer B did not apply the reloaded pending tombstone (resurrection)")
+	}
+}
+
 // MK-6 recreate-over-tombstone across a restart (skeptic #1 §2): A's persisted snapshot
 // holds a tombstone for a path, the file is RECREATED on A's disk while A is down, then A
 // restarts. The recreate must come back with a version vector that DOMINATES the persisted
