@@ -41,6 +41,50 @@ func TestTwoNode_Converge(t *testing.T) {
 	}
 }
 
+// TestTwoNode_ReceiverEmitsZeroIndexUpdates is the two-engine bounded-broadcast-count
+// oracle (PR-6 finding obligation #3; flow-verifier R2; skeptic #1 §3). It lifts the
+// no-sync-loop assertion above the indirect "stable equal roots" of waitConverged to a
+// DIRECT frame count: after the author (A) edits one file and the pair converges, the
+// RECEIVER (B) must have emitted ZERO INDEX_UPDATE broadcasts (an apply is never
+// authorship, SR-6/SR-8 — the load-bearing half) and the AUTHOR must have emitted EXACTLY
+// ONE (the single edit, no ping-pong / echo storm). Counted via Engine.OutboundIndexUpdates,
+// which only broadcastUpdate (the confirmed-local-authorship path) increments.
+func TestTwoNode_ReceiverEmitsZeroIndexUpdates(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start on EMPTY folders and converge, so the only authorship in the measured window
+	// is the single edit below (the startup scan + index exchange author nothing).
+	a := startNode(t, ctx, t.TempDir())
+	b := startNode(t, ctx, t.TempDir())
+	connect(t, a, b)
+	waitConverged(t, a, b, budgetConverge)
+
+	// Baseline the counters AFTER the connect/index exchange has settled.
+	aBase := a.eng.OutboundIndexUpdates()
+	bBase := b.eng.OutboundIndexUpdates()
+
+	// A authors exactly one file; B only ever APPLIES it.
+	preRoot := a.eng.RootHash()
+	write(t, a.dir, "authored-by-A.txt", "the-one-and-only-edit")
+	waitRootChanged(t, a, preRoot, budgetAuthor)
+	waitConverged(t, a, b, budgetConverge)
+
+	// The apply genuinely happened (so "zero outbound on B" is meaningful, not vacuous).
+	if got, ok := read(t, b.dir, "authored-by-A.txt"); !ok || got != "the-one-and-only-edit" {
+		t.Fatalf("B did not apply A's file: %q (ok=%v)", got, ok)
+	}
+
+	// THE OBLIGATION: the receiver emitted zero INDEX_UPDATE applying a received file.
+	if d := b.eng.OutboundIndexUpdates() - bBase; d != 0 {
+		t.Fatalf("receiver B emitted %d INDEX_UPDATE applying a received file, want 0 (SR-6/SR-8, no sync loop)", d)
+	}
+	// And the author's broadcast count is BOUNDED to exactly one for one edit (no ping-pong).
+	if d := a.eng.OutboundIndexUpdates() - aBase; d != 1 {
+		t.Fatalf("author A emitted %d INDEX_UPDATE for one edit, want exactly 1 (bounded, no echo storm)", d)
+	}
+}
+
 // WS-4 #2: simultaneous edits to one file produce a .sync-conflict copy with neither
 // version lost, and the copy filename is byte-identical on both peers.
 func TestConflict_NeitherVersionLostSymmetricName(t *testing.T) {

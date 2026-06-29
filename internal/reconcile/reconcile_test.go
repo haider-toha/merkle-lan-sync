@@ -402,7 +402,6 @@ func TestConflict_DeleteWins_ModificationPreservedAsCopy(t *testing.T) {
 			local := liveFI(key, mod, 1, vv(1, 1)) // live modification, LOW mtime
 			e.mu.Lock()
 			e.files[key] = local
-			e.expected[key] = local.ContentHash
 			e.rebuildLocked()
 			e.mu.Unlock()
 
@@ -728,17 +727,21 @@ func TestAtomicWriteVerify_SuccessAndReRunCompletes(t *testing.T) {
 
 // ---------- WS-4 #4: received file ⇒ zero outbound broadcasts; genuine edit ⇒ one ----------
 
+// TestApply_ZeroOutboundBroadcasts pins the POST-window content-identity filter: an
+// apply has COMPLETED (files recorded, inflight ALREADY clear), the watcher fires on our
+// own write, and it must not be mistaken for authorship; a later genuine edit IS. This
+// deliberately exercises the e.files re-hash echo filter, NOT the in-flight guard (that
+// is TestInflightGuard_SuppressesApplyWindowEcho — the brief pre-completion window).
 func TestApply_ZeroOutboundBroadcasts(t *testing.T) {
 	e := tempEngine(t)
 	fc := newFakeConn(0x30)
 	_ = e.registerFakePeer(fc)
 
-	// Simulate a completed apply: the file is on disk and recorded, with expected-hash.
+	// A COMPLETED apply: the file is on disk and recorded; inflight is clear (post-window).
 	writeFile(t, e, "f.txt", "applied")
 	applied := liveFI("f.txt", "applied", 100, vv(2, 1)) // authored by the PEER
 	e.mu.Lock()
 	e.files["f.txt"] = applied
-	e.expected["f.txt"] = applied.ContentHash
 	e.rebuildLocked()
 	e.mu.Unlock()
 
@@ -747,12 +750,18 @@ func TestApply_ZeroOutboundBroadcasts(t *testing.T) {
 	if n := fc.count(protocol.MsgIndexUpdate); n != 0 {
 		t.Fatalf("apply echo produced %d outbound INDEX_UPDATE, want 0 (SR-6/SR-8)", n)
 	}
+	if n := e.OutboundIndexUpdates(); n != 0 {
+		t.Fatalf("apply echo bumped the outbound counter to %d, want 0", n)
+	}
 
-	// A GENUINE local edit (different bytes) during/after the apply window IS detected.
+	// A GENUINE local edit (different bytes) after the apply window IS detected.
 	writeFile(t, e, "f.txt", "edited-by-user")
 	e.onLocalChange("f.txt")
 	if n := fc.count(protocol.MsgIndexUpdate); n != 1 {
 		t.Fatalf("genuine edit produced %d INDEX_UPDATE, want exactly 1", n)
+	}
+	if n := e.OutboundIndexUpdates(); n != 1 {
+		t.Fatalf("outbound counter = %d after one genuine edit, want exactly 1", n)
 	}
 	// And the broadcast bumped OUR counter on top of the peer's history.
 	e.mu.RLock()
@@ -760,6 +769,125 @@ func TestApply_ZeroOutboundBroadcasts(t *testing.T) {
 	e.mu.RUnlock()
 	if got.Get(e.selfShort) == 0 {
 		t.Fatalf("local edit did not bump our counter: %v", got)
+	}
+}
+
+// TestInflightGuard_SuppressesApplyWindowEcho is the deterministic regression pin for the
+// in-flight-apply guard (SR-8 guard c) — the exact race PR-6 is about, which had ZERO
+// targeted coverage (PR-6 skeptic #1 §2, skeptic #2 §1: deleting inflightLocked failed no
+// test). It reproduces the brief window state DIRECTLY: the path is marked inflight (as an
+// enqueue does), the APPLIED bytes are already on disk (the atomic rename fired the
+// watcher), but e.files STILL holds the OLD leaf (handleCompletion has not run yet). In
+// that state a content-identity filter alone would see APPLIED != OLD and misfire — only
+// the blanket in-flight guard prevents the bump+broadcast that would start the A->B->A
+// loop. Asserted for BOTH change-detection entry points (onLocalChange AND rescan).
+// Windows-hostile keys (reserved device stems) are folded in (paths are involved).
+func TestInflightGuard_SuppressesApplyWindowEcho(t *testing.T) {
+	for _, key := range []string{"f.txt", "sub/CON.txt", "docs/résumé.txt"} {
+		t.Run(key, func(t *testing.T) {
+			for _, via := range []string{"onLocalChange", "rescan"} {
+				t.Run(via, func(t *testing.T) {
+					e := tempEngine(t)
+					fc := newFakeConn(0x33)
+					ps := e.registerFakePeer(fc)
+
+					// Recorded OLD leaf (what we held before the apply), authored by the PEER.
+					old := liveFI(key, "old-content", 100, vv(2, 1))
+					e.mu.Lock()
+					e.files[key] = old
+					e.rebuildLocked()
+					// The atomic rename has landed the APPLIED bytes on disk, but
+					// handleCompletion has NOT yet updated e.files — and the path is in flight.
+					ps.inflight[key] = true
+					e.mu.Unlock()
+					writeFile(t, e, key, "applied-by-peer") // disk = APPLIED != OLD
+
+					switch via {
+					case "onLocalChange":
+						e.onLocalChange(key)
+					case "rescan":
+						e.rescan()
+					}
+
+					if n := fc.count(protocol.MsgIndexUpdate); n != 0 {
+						t.Fatalf("in-flight apply echo via %s produced %d INDEX_UPDATE, want 0 (SR-8 guard c)", via, n)
+					}
+					if n := e.OutboundIndexUpdates(); n != 0 {
+						t.Fatalf("in-flight apply echo via %s bumped outbound counter to %d, want 0", via, n)
+					}
+					// The recorded leaf must be UNTOUCHED — no VV bump, still the peer's leaf.
+					e.mu.RLock()
+					got := e.files[key]
+					e.mu.RUnlock()
+					if got.Version.Get(e.selfShort) != 0 {
+						t.Fatalf("in-flight apply echo via %s bumped OUR counter: %v", via, got.Version)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestInflightGuard_ConcurrentEditCaughtByRescanExactlyOnce discharges the finding's
+// obligation #4 HONESTLY (PR-6 skeptic #1 §1+§2): a genuine user edit that lands DURING
+// the in-flight apply window is suppressed by the blanket guard (deferred, not immediate),
+// then caught by the next full rescan once inflight clears — broadcast EXACTLY ONCE, never
+// lost, and not re-broadcast on subsequent rescans (no echo storm). This proves the blanket
+// mute does not permanently drop a real edit and bounds the broadcast count.
+func TestInflightGuard_ConcurrentEditCaughtByRescanExactlyOnce(t *testing.T) {
+	e := tempEngine(t)
+	fc := newFakeConn(0x34)
+	ps := e.registerFakePeer(fc)
+	const key = "f.txt"
+
+	// OLD recorded leaf + an apply in flight for this path.
+	old := liveFI(key, "old-content", 100, vv(2, 1))
+	e.mu.Lock()
+	e.files[key] = old
+	e.rebuildLocked()
+	ps.inflight[key] = true
+	e.mu.Unlock()
+
+	// A GENUINE concurrent user edit lands on disk DURING the window (third content,
+	// neither OLD nor the bytes being applied).
+	writeFile(t, e, key, "user-edit-during-window")
+
+	// While inflight: BOTH entry points must suppress (deferred — broadcast exactly once,
+	// but LATER; not now).
+	e.onLocalChange(key)
+	e.rescan()
+	if n := e.OutboundIndexUpdates(); n != 0 {
+		t.Fatalf("concurrent edit was broadcast DURING the in-flight window (%d), want 0 (deferred)", n)
+	}
+
+	// The apply completes: handleCompletion records the applied leaf and clears inflight.
+	applied := liveFI(key, "applied-by-peer", 200, vv(2, 2))
+	e.mu.Lock()
+	e.files[key] = applied
+	e.rebuildLocked()
+	delete(ps.inflight, key)
+	e.mu.Unlock()
+
+	// The next rescan is the source of truth (SR-11): it sees disk (the user edit) != the
+	// recorded applied leaf ⇒ genuine local authorship ⇒ broadcast EXACTLY ONCE.
+	e.rescan()
+	if n := e.OutboundIndexUpdates(); n != 1 {
+		t.Fatalf("post-window rescan broadcast count = %d, want exactly 1 (caught, not lost; no storm)", n)
+	}
+	e.mu.RLock()
+	got := e.files[key]
+	e.mu.RUnlock()
+	if got.ContentHash != merkle.HashBytes([]byte("user-edit-during-window")) {
+		t.Fatalf("rescan did not record the concurrent user edit: %+v", got)
+	}
+	if got.Version.Get(e.selfShort) == 0 {
+		t.Fatalf("recovered concurrent edit was not stamped as local authorship: %v", got.Version)
+	}
+
+	// A FURTHER rescan re-broadcasts NOTHING (the edit is now recorded — idempotent).
+	e.rescan()
+	if n := e.OutboundIndexUpdates(); n != 1 {
+		t.Fatalf("a redundant rescan re-broadcast (count now %d), want it to stay 1", n)
 	}
 }
 
@@ -1003,7 +1131,6 @@ func TestReconcile_RefusesFileVsDirTypeClash(t *testing.T) {
 			writeFile(t, e, tc.untouched, tc.wantContent)
 			e.mu.Lock()
 			e.files[tc.localKey] = liveFI(tc.localKey, tc.wantContent, 1, vv(1, 1))
-			e.expected[tc.localKey] = merkle.HashBytes([]byte(tc.wantContent))
 			e.mu.Unlock()
 
 			// Peer side: advertises the clashing shape.

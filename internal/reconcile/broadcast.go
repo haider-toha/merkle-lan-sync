@@ -57,6 +57,10 @@ func (e *Engine) broadcastUpdate(changed []merkle.FileInfo) {
 	if len(changed) == 0 {
 		return
 	}
+	// Count this confirmed-local-authorship broadcast — the directly-countable SR-6 /
+	// PR-6 oracle. An APPLY path never reaches here (handleCompletion does not broadcast),
+	// so a peer's apply leaves this UNCHANGED; only a real local change increments it.
+	e.outboundIndexUpdates.Add(1)
 	orderCreatesBeforeDeletes(changed)
 	body, err := merkle.EncodeFileInfos(changed)
 	if err != nil {

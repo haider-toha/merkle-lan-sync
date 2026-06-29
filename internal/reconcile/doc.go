@@ -5,8 +5,8 @@
 // # Concurrency model (GR-5 / CDD-1)
 //
 // One goroutine (Engine.Run's loop) owns every mutation of the reconcile core's
-// in-memory state — the FileInfo set + cached tree, the per-peer last-index/ack
-// state, and the apply-time expected-hash record — behind one sync.RWMutex, and does
+// in-memory state — the FileInfo set + cached tree and the per-peer last-index/ack +
+// in-flight-apply state — behind one sync.RWMutex, and does
 // ZERO network/disk I/O while the lock is held (the watcher<->apply deadlock GR-5
 // forbids). Outbound control messages use the transport's non-blocking, buffered-
 // with-shed Conn.Send, so the loop never blocks on a peer. Bulk chunk transfer runs
@@ -28,8 +28,9 @@
 //     (conflict.go; WS-4 #2/#5).
 //   - SR-5 — convergence at quiescence: bit-identical roots once propagation settles.
 //   - SR-6/SR-8 — bump the VV + broadcast only on confirmed LOCAL authorship; a
-//     received file is filtered by content identity, never re-broadcast (broadcast.go,
-//     apply.go; WS-4 #4).
+//     received file is filtered by content identity against the recorded leaf PLUS a
+//     blanket in-flight-apply guard over the brief rename->completion window, never
+//     re-broadcast (broadcast.go, engine.go; WS-4 #4 / PR-6).
 //   - SR-9/SR-10 — deletions are tombstones whose bumped VV dominates a stale absent
 //     counter; tombstones are GC'd only after the peer acks (tombstone.go; WS-4 #6).
 //   - SR-11/GR-9/GR-10 — the watcher is an advisory debounced hint; the periodic full

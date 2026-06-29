@@ -218,8 +218,9 @@ func (e *Engine) localSource(hash [32]byte, excludeKey string) (string, bool) {
 }
 
 // materialise makes the on-disk file at leaf.Path hold leaf's content, then reports a
-// completion to the engine loop (which updates the FileInfo map + expected-hash record
-// under the lock). It runs in the per-peer puller goroutine, OFF the engine select
+// completion to the engine loop (which updates the FileInfo map under the lock; the
+// recorded leaf is the echo record a later re-hash is compared against). It runs in the
+// per-peer puller goroutine, OFF the engine select
 // loop (CDD-1). Order: idempotence skip -> no-clobber refuse -> local reuse -> network
 // fetch. v1 materialises regular files; a non-regular leaf (symlink) is flagged and
 // skipped (XP-6, N14 — symlinks lossy/deferred).

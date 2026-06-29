@@ -163,11 +163,18 @@ type Engine struct {
 	enableWatcher bool
 	logf          func(string, ...any)
 
-	mu       sync.RWMutex // guards files, tree, expected, peers (the reconcile core)
-	files    map[string]merkle.FileInfo
-	tree     *merkle.Tree
-	expected map[string][32]byte
-	peers    map[protocol.DeviceID]*peerState
+	mu    sync.RWMutex // guards files, tree, peers (the reconcile core)
+	files map[string]merkle.FileInfo
+	tree  *merkle.Tree
+	peers map[protocol.DeviceID]*peerState
+
+	// outboundIndexUpdates counts the non-empty INDEX_UPDATE broadcasts this engine has
+	// emitted since start — the directly-countable SR-6 / PR-6 oracle ("a received file
+	// produces ZERO outbound"). Only confirmed-local-authorship paths (onLocalChange /
+	// rescan / applyTombstone, via broadcastUpdate) increment it; an APPLY never does.
+	// Incremented on the engine loop, read via OutboundIndexUpdates; atomic so a metric
+	// or test reader cannot race the loop.
+	outboundIndexUpdates atomic.Int64
 
 	pairedShorts map[protocol.ShortID]bool // {self} ∪ declared peers; gates the de-pair ghost-counter sweep
 	pairedKnown  bool                      // Config.Peers was provided (non-nil) ⇒ the sweep is enabled
@@ -220,7 +227,6 @@ func New(cfg Config) (*Engine, error) {
 		enableWatcher:    cfg.EnableWatcher,
 		logf:             cfg.Logf,
 		files:            make(map[string]merkle.FileInfo),
-		expected:         make(map[string][32]byte),
 		peers:            make(map[protocol.DeviceID]*peerState),
 		dialing:          make(map[protocol.DeviceID]bool),
 		localChanges:     make(chan string, chanDepth),
@@ -333,6 +339,14 @@ func (e *Engine) Snapshot() []merkle.FileInfo {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.snapshotFilesLocked()
+}
+
+// OutboundIndexUpdates returns the number of non-empty INDEX_UPDATE broadcasts this
+// engine has emitted since start — the directly-countable SR-6 / PR-6 no-sync-loop
+// oracle. A peer APPLYING a received file must leave this UNCHANGED (an apply is never
+// authorship, SR-8); only a confirmed local change increments it. For metrics + tests.
+func (e *Engine) OutboundIndexUpdates() int64 {
+	return e.outboundIndexUpdates.Load()
 }
 
 // Hello provides the engine's current HELLO for the transport's WithHello (the
@@ -859,10 +873,17 @@ func (e *Engine) flagTypeClash(d merkle.DiffEntry) {
 }
 
 // inflightLocked reports whether any peer is currently materialising key (an apply in
-// progress). Caller holds e.mu. The change-detection paths consult this so the brief
-// window between a fetched file's atomic rename and its handleCompletion (when files +
-// expected are updated) is NOT mistaken for local authorship — which would bump the VV
-// for content we are applying, not authoring, and diverge the peers (SR-8 guard c).
+// progress). Caller holds e.mu. The change-detection paths BLANKET-suppress authorship
+// for an in-flight path so the brief window between a fetched file's atomic rename and
+// its handleCompletion (when files is updated) is NOT mistaken for local authorship —
+// which would bump the VV for content we are applying, not authoring, and diverge the
+// peers into an A->B->A echo loop (SR-8 guard c). This is deliberately a blanket mute,
+// NOT a content compare: during the window e.files still holds the OLD leaf, so a
+// content-identity filter alone (APPLIED != OLD) would misfire and re-broadcast our own
+// apply. The cost of the blanket mute is bounded and recovered: a GENUINE concurrent
+// edit that lands in this sub-millisecond window is deferred, then caught by the next
+// full rescan (the source of truth, SR-11) once inflight clears — delayed, broadcast
+// exactly once, never lost (TestInflightGuard_ConcurrentEditCaughtByRescanExactlyOnce).
 func (e *Engine) inflightLocked(key string) bool {
 	for _, ps := range e.peers {
 		if ps.inflight[key] {
@@ -951,7 +972,7 @@ func (e *Engine) enqueueRename(ps *peerState, newCreate, oldTomb merkle.FileInfo
 }
 
 // applyTombstone removes the on-disk file (off the lock) then records the tombstone
-// and its expected (zero) hash under the lock. On a real transition (we previously
+// under the lock. On a real transition (we previously
 // held the file, or a different version) it RE-ADVERTISES the tombstone once: this
 // is not new authorship (it carries the origin's VV, so the peer sees Equal and the
 // apply is idempotent — no sync loop), it is the symmetric-GC handshake — it tells
@@ -966,7 +987,6 @@ func (e *Engine) applyTombstone(t merkle.FileInfo) {
 	prev, had := e.files[t.Path]
 	redundant := had && prev.Deleted && prev.Version.IsEqual(t.Version)
 	e.files[t.Path] = t
-	e.expected[t.Path] = t.ContentHash
 	e.rebuildLocked()
 	e.mu.Unlock()
 	if !redundant {
@@ -1041,10 +1061,11 @@ func (e *Engine) report(c completion) {
 	}
 }
 
-// handleCompletion installs a successfully-materialised leaf (updating the FileInfo
-// map + the expected-hash echo record under the lock — NEVER broadcasting, since an
-// apply is not local authorship, SR-6/SR-8), then re-reconciles with the source peer
-// to drain remaining diffs promptly.
+// handleCompletion installs a successfully-materialised leaf (updating the FileInfo map
+// under the lock — NEVER broadcasting, since an apply is not local authorship,
+// SR-6/SR-8; the recorded leaf IS the echo record the change-detection paths compare a
+// later re-hash against), then re-reconciles with the source peer to drain remaining
+// diffs promptly.
 func (e *Engine) handleCompletion(c completion) {
 	if c.applyTomb {
 		// A coupled conflict whose winner is a TOMBSTONE: the loser copy already landed,
@@ -1071,7 +1092,6 @@ func (e *Engine) handleCompletion(c completion) {
 	if c.ok {
 		e.mu.Lock()
 		e.files[c.leaf.Path] = c.leaf
-		e.expected[c.leaf.Path] = c.leaf.ContentHash
 		e.rebuildLocked()
 		e.mu.Unlock()
 		// A conflict copy is a NEW path the peer may lack; advertise it so the peer
@@ -1112,7 +1132,10 @@ func (e *Engine) onLocalChange(key string) {
 	inflight := e.inflightLocked(key)
 	e.mu.RUnlock()
 	if inflight {
-		return // an apply is materialising this path — not local authorship (SR-8)
+		// An apply is materialising this path: blanket-suppress (SR-8 guard c). A genuine
+		// concurrent edit landing now is caught by the next rescan once inflight clears
+		// (SR-11) — deferred, broadcast exactly once, never lost. See inflightLocked.
+		return
 	}
 
 	if statErr != nil { // file gone
@@ -1120,7 +1143,6 @@ func (e *Engine) onLocalChange(key string) {
 			tomb := prev.SetDeleted(e.selfShort)
 			e.mu.Lock()
 			e.files[key] = tomb
-			delete(e.expected, key)
 			e.rebuildLocked()
 			e.mu.Unlock()
 			e.broadcastUpdate([]merkle.FileInfo{tomb})
@@ -1147,7 +1169,6 @@ func (e *Engine) onLocalChange(key string) {
 	nfi.Version = prev.Version.Bump(e.selfShort) // prev.Version is empty for a new file
 	e.mu.Lock()
 	e.files[key] = nfi
-	delete(e.expected, key)
 	e.rebuildLocked()
 	e.mu.Unlock()
 	e.broadcastUpdate([]merkle.FileInfo{nfi})
@@ -1181,11 +1202,12 @@ func (e *Engine) rescan() {
 			continue // unchanged / echo
 		}
 		if e.inflightLocked(s.Path) {
-			continue // an apply is materialising this path — not local authorship (SR-8)
+			// Apply in flight: blanket-suppress (SR-8 guard c). A genuine concurrent edit
+			// is picked up by a LATER rescan once inflight clears (SR-11) — never lost.
+			continue
 		}
 		s.Version = prev.Version.Bump(e.selfShort)
 		e.files[s.Path] = s
-		delete(e.expected, s.Path)
 		delta = append(delta, s)
 	}
 	for path, fi := range e.files {
@@ -1195,7 +1217,6 @@ func (e *Engine) rescan() {
 		if _, ok := present[path]; !ok {
 			tomb := fi.SetDeleted(e.selfShort)
 			e.files[path] = tomb
-			delete(e.expected, path)
 			delta = append(delta, tomb)
 		}
 	}
