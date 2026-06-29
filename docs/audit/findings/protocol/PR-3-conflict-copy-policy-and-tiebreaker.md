@@ -3,8 +3,19 @@
 - Phase / role: Phase 2 — protocol-researcher
 - Severity: **high** (this is the literal no-data-loss contract; an asymmetric or
   non-deterministic winner rule means the two peers diverge or one version is lost)
-- Status: open (research finding; implements hard rule SR-7; no new decision needed —
-  SR-7 already pins the policy, this finding proves it deterministic + symmetric)
+- Status: **fixed** (WS-4) — the total+commutative winner `W` (`aWins`/`winner`/
+  `loserOf`), the deterministic UTC-whole-second `.sync-conflict` copy name
+  (`conflictName`), and the symmetric keep-both materialisation (winner at the path
+  with merged VV; loser preserved as a copy, never deleted) are implemented in
+  `internal/reconcile/{conflict,apply,engine}.go` and verified by
+  `reconcile_test.go` (`TestW_Commutative`, `TestConflict_CopyName*`,
+  `TestResolver_*`) + integration `TestConflict_NeitherVersionLostSymmetricName`
+  (both peers converge to the same `{f.txt, byte-identical .sync-conflict copy}`,
+  neither version lost). Decisions
+  `docs/audit/decisions/ws4/resolver-totality-conflict-identity-and-sync-loop.md`.
+  Commit `af12de099165f38e11556555acc986b9ba385f24`. (Implements SR-7; no new
+  decision needed — SR-7 already pins the policy, this finding proves it
+  deterministic + symmetric.)
 - Reads-first honoured: `sync-rules.md` SR-4/SR-7/SR-9, `findings/literature/syncthing-bep.md`
   §4.6/§5, `findings/literature/version-vectors.md` §4.6/FM-6, `findings/codebases/syncthing-source.md`
   A2-3, SKILL §3.

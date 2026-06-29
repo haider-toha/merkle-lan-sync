@@ -5,9 +5,14 @@
   the merkle lane; primary decision owner is the Phase 3 tree-critic)
 - Status: **fixed** (WS-1) — the snapshot persist/load + startup `SynthesizeDeletions`
   diff are implemented and tested in `internal/merkle/{snapshot.go,scanner.go}`
-  (decision `docs/audit/decisions/ws1/snapshot-and-deletion-synthesis.md`); the
-  WS-4 startup wiring (calling these at boot) remains for WS-4. Fixed by commit
-  `182ff00a16868df05377cb3585b914aa1d59784e`.
+  (decision `docs/audit/decisions/ws1/snapshot-and-deletion-synthesis.md`). The
+  WS-4 startup wiring is now landed: `internal/reconcile/engine.go`
+  `startupReconcile`/`restoreVVs` load the snapshot, restore version vectors, and call
+  `SynthesizeDeletions` at boot, and the snapshot is persisted on shutdown +
+  periodically (`saveSnapshot`); a missing snapshot enters cold-start reseed
+  (vv-counter-seeding). Fixed by commit
+  `182ff00a16868df05377cb3585b914aa1d59784e` (WS-1) +
+  `af12de099165f38e11556555acc986b9ba385f24` (WS-4 wiring).
 - Severity: **high** (this is synthesis risk **R-5**, "the least-mitigated risk";
   no existing rule covers it; the failure is missed deletions / resurrection /
   divergence after a restart)

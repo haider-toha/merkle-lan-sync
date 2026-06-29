@@ -3,9 +3,17 @@
 - Phase / role: Phase 2 — protocol-researcher
 - Severity: **medium** (correctness is fine either way; the difference is transfer
   efficiency — a naive scheme re-sends the whole file on a rename — not data loss)
-- Status: open (research finding). **Binding decision owner = merkle-researcher
-  (synthesis OQ-7 → `decisions/ws1/`)**; this finding contributes the *protocol-layer*
-  analysis + recommendation and is explicit that it does not pre-empt that decision.
+- Status: **fixed** (WS-4) — v1 rename is the emergent delete+create: the scanner
+  synthesizes a tombstone for the old path and a create for the new, the broadcast
+  orders creates-before-deletes (`broadcast.go` `orderCreatesBeforeDeletes`), and the
+  puller's local content-addressed reuse (`transfer.go` `localSource`) makes the new
+  path cost ZERO network when the bytes are still local. Verified by
+  `reconcile_test.go` `TestRename_NoNetworkTransfer` +
+  `TestRescan_DetectsRenameAsDeleteCreate`. Decision
+  `docs/audit/decisions/ws4/tombstone-lifecycle-rename-and-no-clobber.md`. Commit
+  `af12de099165f38e11556555acc986b9ba385f24`. **Binding decision owner =
+  merkle-researcher (synthesis OQ-7)**; this finding contributed the protocol-layer
+  analysis and the chosen v1 approach matches it (no new wire type; `MOVE` deferred).
 - Reads-first honoured: `findings/synthesis/problem-space-map.md` OQ-7,
   `findings/literature/rsync-algorithm.md` §9.5, `findings/literature/merkle-tree.md` §4.6,
   `findings/literature/syncthing-bep.md` §7.

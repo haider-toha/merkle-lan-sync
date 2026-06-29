@@ -3,8 +3,17 @@
 - Phase / role: Phase 2 — protocol-researcher
 - Severity: **high** (a resurrected deletion is "inverse data loss" — the file you
   deleted comes back — and is the marquee long-lived sync bug, Syncthing #10590)
-- Status: open (research finding; implements SR-9/SR-10; backs
-  `decisions/protocol/tombstone-retention-gc.md` and `vv-pruning-counter-cleanup.md`)
+- Status: **fixed** (WS-4) — `merkle.SetDeleted` tombstones with bumped-VV dominance
+  resist resurrection (a stale peer's pre-delete file is `DominatedBy` ⇒ deleted, not
+  re-created); `canGC` ack-gates symmetric tombstone GC and `DropCounter` strips a
+  de-paired device's counter, both in `internal/reconcile/tombstone.go`; an applied
+  tombstone is re-advertised once (origin VV) so both peers GC together. Verified by
+  `reconcile_test.go` (`TestCanGC`, `TestGCTombstones_AckGated`,
+  `TestTombstone_NoResurrectionAndPrematureGCNegative` — the premature-GC negative
+  proves the gate is load-bearing) + integration `TestDeletion_NoResurrection`.
+  Decision `docs/audit/decisions/ws4/tombstone-lifecycle-rename-and-no-clobber.md`.
+  Commit `af12de099165f38e11556555acc986b9ba385f24`. (Implements SR-9/SR-10; backs
+  `decisions/protocol/tombstone-retention-gc.md` and `vv-pruning-counter-cleanup.md`.)
 - Reads-first honoured: `sync-rules.md` SR-9/SR-10, `findings/literature/syncthing-bep.md`
   §4.5/§10.5, `findings/literature/version-vectors.md` FM-1/§4.3, SKILL §4.
 - Evidence: `SetDeleted` ground-truth `bep_fileinfo.go:588-594`; resurrection symptom

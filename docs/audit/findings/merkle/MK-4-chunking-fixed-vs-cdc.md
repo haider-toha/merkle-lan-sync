@@ -2,7 +2,14 @@
 
 - Slug: `MK-4-chunking-fixed-vs-cdc`
 - Phase / role: Phase 2 — merkle-researcher
-- Status: complete; backs `decisions/merkle/chunking-fixed-32kib-vs-cdc.md`
+- Status: complete; backs `decisions/merkle/chunking-fixed-32kib-vs-cdc.md`.
+  **Implemented in WS-4** (`internal/reconcile/transfer.go`): fixed 32 KiB
+  content-addressed blocks (`BlockSize`), local content-addressed reuse before any
+  network fetch, and the whole-file verify-after-reconstruct before an atomic
+  temp→fsync→rename→dir-fsync (`atomicWriteVerify`); tested by `reconcile_test.go`
+  (`TestNumBlocks`, `TestAtomicWriteVerify_*`, `TestRename_NoNetworkTransfer`) +
+  integration `TestBackpressure_BidirectionalConverges`. Commit
+  `af12de099165f38e11556555acc986b9ba385f24`.
 - Severity: **medium** (the v1 choice is low-risk; the cross-peer-determinism
   requirement for any future CDC is high-stakes but deferred; the large-file
   index-bloat caveat is real)

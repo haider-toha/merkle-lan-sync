@@ -3,7 +3,17 @@
 - Phase / role: Phase 2 — protocol-researcher
 - Severity: **high** (a sync loop is a self-sustaining CPU/network storm that also
   spawns repeated spurious conflict copies — R-2 in the synthesis risk register)
-- Status: open (research finding; implements SR-6 + SR-8 + SR-3)
+- Status: **fixed** (WS-4) — the three guards are implemented: bump+broadcast only on
+  confirmed local authorship (`engine.go` `onLocalChange`/`rescan`, `broadcast.go`);
+  applying a received file calls `Merge`, never `Bump`, and is filtered by content
+  identity PLUS an in-flight-apply guard (`inflightLocked`) so the brief
+  rename-before-handleCompletion window is never mistaken for authorship (SR-8);
+  idempotent content-addressed apply makes a redelivery a literal no-op (SR-3).
+  Verified by `reconcile_test.go` `TestApply_ZeroOutboundBroadcasts` (apply echo ⇒ 0
+  outbound, genuine edit ⇒ exactly 1) + `TestApply_IdempotentRedelivery`, and the
+  integration convergence tests assert stable equal roots (no ping-pong). Decision
+  `docs/audit/decisions/ws4/resolver-totality-conflict-identity-and-sync-loop.md`.
+  Commit `af12de099165f38e11556555acc986b9ba385f24`. (Implements SR-6 + SR-8 + SR-3.)
 - Reads-first honoured: `sync-rules.md` SR-3/SR-6/SR-8, `go-rules.md` GR-9/GR-10,
   `findings/synthesis/problem-space-map.md` R-2, `findings/codebases/syncthing-source.md`
   §1d (`walk.go:649-657`), SKILL §3/§8.
