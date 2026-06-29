@@ -1,11 +1,52 @@
 # Finding (Phase 6 / review): integration convergence timeouts flake under CPU starvation
 
 - ID: REV-FLAKE-1
-- Severity: low (liveness / test-robustness — NOT correctness)
-- Status: resolved (harness de-flaked; production unaffected) — landed in commit `b2b298b`
+- Severity: **raised to medium** (the Phase-7 reproduction proved this is a real engine
+  liveness/correctness defect, not merely test-robustness — see the Phase-7 update below)
+- Status: **fixed** — Phase 7, round 1, commit `68c65f777fba27c6eeb590824f16862cd1954e10`
+  (the Phase-6 `b2b298b` budget/rescan tuning only mitigated it; the two skeptic votes
+  refuting the "FIXED" verdict were UPHELD — the root cause persisted, as they predicted).
 - Date: 2026-06-29
-- Evidence: reproductions below; fix in `test/integration/helpers.go` + `sync_test.go`;
-  decision `docs/audit/decisions/phase6/convergence-timeout-deflake.md`.
+- Evidence: reproductions below + the Phase-7 root-cause section; fix in
+  `internal/merkle/hash.go`, `internal/merkle/scanner.go`, `internal/reconcile/engine.go`,
+  `internal/transport/{conn,transport}.go`, `test/integration/{helpers,sync}_test.go`;
+  regression guard `internal/merkle/scan_torn_test.go`; decision
+  `docs/audit/decisions/phase7/REV-FLAKE-1-torn-scan-size-hash.md` (supersedes the
+  Phase-6 `convergence-timeout-deflake.md` diagnosis).
+
+## Phase-7 update — the REAL root cause (the skeptics were right)
+
+Reproducing under the skeptics' 12-24× `GOMAXPROCS=2` race oversubscription (8/12
+binaries failed at the start) and instrumenting the engine showed the stalls are NOT a
+timeout-tuning artifact — they are two real defects no budget can clear:
+
+1. **Torn (Size, ContentHash) leaf.** `merkle.Scan`/`Engine.scanOne` sourced `Size` from
+   `os.Stat`/`DirEntry.Info()` but `ContentHash` from a SEPARATE `HashFile` pass. A file
+   written concurrently with a scan yields a leaf whose Size and hash come from different
+   file-states (observed: `Size=0` with the hash of a 9-byte file). That leaf is
+   un-transferable — the receiver computes `numBlocks(0)=0`, reconstructs the empty file,
+   fails verify-before-rename forever — and the rescan "unchanged" check (ContentHash+Type
+   only) never corrects it ⇒ permanent non-convergence presenting as the conflict-test
+   "timeout." Fix: `HashFileSize` derives Size from the bytes streamed through the hasher;
+   Size also joins the change-detection key (self-heal). Guard: `scan_torn_test.go`.
+
+2. **Lost-on-connect INDEX wedge** (the large-file backpressure residual). `Conn.newConn`
+   starts the reader before `register` emits `PeerConnected`; both feed the same fan-in
+   events channel, so under load a peer's one-shot INDEX could be delivered first and be
+   dropped by `handleMessage` as an unknown peer. INDEX is never re-exchanged ⇒ the peers
+   diverge forever (one direction transfers, the other silently never starts). Fix: a
+   `Conn.registered` gate ordering PeerConnected strictly before any PeerMessage.
+
+Two harness flakes the same repro exposed were also fixed: the rename tests' missing
+`waitRootChanged` (a `waitConverged` stale-state TOCTOU) and the non-atomic `write()`
+helper (empty-then-full double authorship breaking the bounded-broadcast oracle; now
+temp+rename). Post-fix: 120 oversubscribed race binaries (6×12 + 2×24) → 0 failures; the
+backpressure long-budget probe 864 execs → 0 wedges; `go test ./... -race` green;
+`GOOS=windows` cross-compiles. No production default changed.
+
+---
+
+### Original Phase-6 framing (retained for the audit trail; the diagnosis below was wrong)
 
 ## Claim
 
