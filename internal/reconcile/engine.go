@@ -645,6 +645,13 @@ func (e *Engine) reconcileWithPeer(ps *peerState) {
 		return
 	}
 	for _, d := range merkle.Diff(localTree, peerTree) {
+		// A file-vs-directory type clash is structurally irreconcilable at one path
+		// without choosing a loser: refuse + flag (no data lost, no impossible install,
+		// no livelock), NEVER feed its nil side to resolve as a false absence (MK-2).
+		if d.IsTypeClash() {
+			e.flagTypeClash(d)
+			continue
+		}
 		e.execute(ps, resolve(d.Local, d.Remote, e.selfShort))
 	}
 	e.mu.Lock()
@@ -682,6 +689,21 @@ func (e *Engine) execute(ps *peerState, p plan) {
 		} else {
 			e.enqueueFetch(ps, p.winner, false)
 		}
+	}
+}
+
+// flagTypeClash records a file-vs-directory divergence at one path (one peer has a
+// FILE there, the other a DIRECTORY) and does nothing destructive: it enqueues no
+// fetch and reports no completion, so neither the impossible install nor a retry
+// livelock can occur. Both peers keep their own data (no loss); the path is left
+// divergent and FLAGGED, the same accepted carve-out as the CDD-5 case-clobber refuse.
+// Auto keep-both (directory wins, file -> .sync-conflict copy, both converge) is the
+// logged forward path (decisions/phase7/MK-2-file-vs-dir-typeclash-resolution.md).
+func (e *Engine) flagTypeClash(d merkle.DiffEntry) {
+	if d.RemoteDir {
+		e.logf("%v: %q is a FILE locally but a DIRECTORY on the peer — refused (no data lost; resolve by hand)", ErrTypeClash, d.Path)
+	} else {
+		e.logf("%v: %q is a DIRECTORY locally but a FILE on the peer — refused (no data lost; resolve by hand)", ErrTypeClash, d.Path)
 	}
 }
 

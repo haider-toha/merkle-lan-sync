@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"os"
@@ -569,6 +570,109 @@ func TestApply_RefusesCaseClobber(t *testing.T) {
 	osPath := pathnorm.ToOSPath(e.absRoot, "File.txt", pathnorm.HostTarget())
 	if got, _ := os.ReadFile(osPath); string(got) != "keep-me" {
 		t.Fatalf("existing file was clobbered: %q", got)
+	}
+}
+
+// ---------- MK-2 (Phase 7): file-vs-directory type clash is refused + flagged ----------
+
+// TestReconcile_RefusesFileVsDirTypeClash — when the local tree has a FILE at a path
+// the peer holds as a DIRECTORY (or vice versa), reconcileWithPeer must REFUSE: it
+// flags the clash, enqueues NO fetch, produces NO completion, and leaves local data
+// untouched — never feeding the differ's directory side to resolve as a false absence
+// (which previously livelocked on an impossible mkdir/rename, MK-2 refutation). Both
+// directions are exercised. (decisions/phase7/MK-2-file-vs-dir-typeclash-resolution.md)
+func TestReconcile_RefusesFileVsDirTypeClash(t *testing.T) {
+	cases := []struct {
+		name        string
+		localKey    string // a file we hold locally (on disk + in e.files)
+		peerKey     string // what the peer advertises in its index
+		untouched   string // the local on-disk path that must survive unchanged
+		wantContent string // its expected bytes afterwards
+		wantLogText string // the flag the engine must surface
+	}{
+		{
+			name:        "local-file-vs-peer-dir",
+			localKey:    "foo",         // local: foo is a FILE
+			peerKey:     "foo/bar.txt", // peer: foo is a DIRECTORY
+			untouched:   "foo",
+			wantContent: "my-file-bytes",
+			wantLogText: "is a FILE locally but a DIRECTORY on the peer",
+		},
+		{
+			name:        "local-dir-vs-peer-file",
+			localKey:    "foo/bar.txt", // local: foo is a DIRECTORY
+			peerKey:     "foo",         // peer: foo is a FILE
+			untouched:   "foo/bar.txt",
+			wantContent: "my-dir-child-bytes",
+			wantLogText: "is a DIRECTORY locally but a FILE on the peer",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := tempEngine(t)
+			var (
+				logMu   sync.Mutex
+				logs    []string
+				clashed bool
+			)
+			e.logf = func(format string, args ...any) {
+				logMu.Lock()
+				defer logMu.Unlock()
+				line := fmt.Sprintf(format, args...)
+				logs = append(logs, line)
+				if strings.Contains(line, ErrTypeClash.Error()) {
+					clashed = true
+				}
+			}
+
+			// Local side: the file exists on disk AND in the recorded state.
+			writeFile(t, e, tc.untouched, tc.wantContent)
+			e.mu.Lock()
+			e.files[tc.localKey] = liveFI(tc.localKey, tc.wantContent, 1, vv(1, 1))
+			e.expected[tc.localKey] = merkle.HashBytes([]byte(tc.wantContent))
+			e.mu.Unlock()
+
+			// Peer side: advertises the clashing shape.
+			fc := newFakeConn(0x70)
+			ps := e.registerFakePeer(fc)
+			ps.index[tc.peerKey] = liveFI(tc.peerKey, "peer-bytes", 2, vv(2, 1))
+
+			e.reconcileWithPeer(ps)
+
+			// No impossible install was enqueued, and nothing is in flight.
+			if n := len(ps.fetchQ); n != 0 {
+				t.Errorf("a fetch was enqueued for a type clash (%d queued) — must refuse, not attempt", n)
+			}
+			if n := len(ps.inflight); n != 0 {
+				t.Errorf("inflight is non-empty (%d) after a refused clash", n)
+			}
+			// No completion was produced (no retry-livelock fuel).
+			select {
+			case c := <-e.completions:
+				t.Fatalf("a completion was produced for a refused clash: %+v", c)
+			default:
+			}
+			// The clash was flagged loudly (ErrTypeClash, with the direction + path).
+			logMu.Lock()
+			defer logMu.Unlock()
+			if !clashed {
+				t.Errorf("clash was not flagged with %v; logs=%v", ErrTypeClash, logs)
+			}
+			foundDir := false
+			for _, l := range logs {
+				if strings.Contains(l, tc.wantLogText) && strings.Contains(l, "foo") {
+					foundDir = true
+				}
+			}
+			if !foundDir {
+				t.Errorf("expected a flag log %q mentioning the path; logs=%v", tc.wantLogText, logs)
+			}
+			// No data loss: the local file is byte-for-byte intact.
+			osPath := pathnorm.ToOSPath(e.absRoot, tc.untouched, pathnorm.HostTarget())
+			if got, _ := os.ReadFile(osPath); string(got) != tc.wantContent {
+				t.Errorf("local data changed by a refused clash: got %q want %q", got, tc.wantContent)
+			}
+		})
 	}
 }
 

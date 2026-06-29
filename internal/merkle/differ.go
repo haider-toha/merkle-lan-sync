@@ -7,11 +7,28 @@ import "sort"
 // pre-classified as a create or a delete: absence is ambiguous (deleted here, not
 // yet created here, or deleted there), and only the version-vector + tombstone
 // resolver (WS-4) may decide direction (MK-2).
+//
+// A nil Local/Remote means TRUE absence on that side EXCEPT on a file-vs-directory
+// type clash, where the corresponding LocalDir/RemoteDir flag is set: at this exact
+// path one side is a file leaf and the other is a DIRECTORY (e.g. a file deleted +
+// recreated as a dir of the same name, or a Mac↔Windows structural divergence). The
+// directory has no leaf, so its *FileInfo is nil — but the path is NOT absent there;
+// the flag says so. Emitting that nil without the flag would be a FALSE "absent"
+// signal, breaking the "absence is ambiguous" invariant (MK-2 refutation). The
+// resolver MUST consult IsTypeClash before treating a nil side as absence.
 type DiffEntry struct {
-	Path   string
-	Local  *FileInfo // nil if the path is absent locally
-	Remote *FileInfo // nil if the path is absent remotely
+	Path      string
+	Local     *FileInfo // nil if the path is absent locally, OR LocalDir (a directory, no leaf)
+	Remote    *FileInfo // nil if the path is absent remotely, OR RemoteDir (a directory, no leaf)
+	LocalDir  bool      // local side is a DIRECTORY at this path while remote is a file leaf (type clash)
+	RemoteDir bool      // remote side is a DIRECTORY at this path while local is a file leaf (type clash)
 }
+
+// IsTypeClash reports whether this entry is a file-vs-directory type clash (one side a
+// file leaf, the other a directory at the same path). On a clash the nil side is NOT
+// absent — it is a directory — so the resolver must refuse to read the nil as a
+// create/delete (MK-2).
+func (e DiffEntry) IsTypeClash() bool { return e.LocalDir || e.RemoteDir }
 
 // Diff returns the set of differing paths between local and remote. It prunes any
 // subtree whose two node hashes are equal at the top of the call (never recursing
@@ -76,14 +93,27 @@ func diffNodes(path string, l, r *Node, out *[]DiffEntry, comparisons *int) {
 		return
 	}
 
-	// At least one side is a directory. If the other side is a file at this exact
-	// path, emit it as a single-sided candidate (a file-vs-directory divergence),
-	// then descend the directory side(s).
-	if lLeaf {
-		emit(out, path, l, nil)
-	}
-	if rLeaf {
-		emit(out, path, nil, r)
+	// FILE-vs-DIRECTORY TYPE CLASH: exactly one side is a file leaf and the other is
+	// a directory at this same path. Emit ONE truthful clash entry — the file leaf on
+	// its side, the *Dir flag on the directory side (whose *FileInfo stays nil because
+	// a directory has no leaf) — and PRUNE the directory subtree. Two reasons not to
+	// recurse it: (1) emitting the file side with the other side nil and no flag would
+	// be a FALSE "absent" signal, the exact MK-2 refutation; (2) the directory's
+	// children cannot be materialised on the file side while the path is a file, so
+	// recursing them only manufactures impossible single-sided installs (the WS-4
+	// livelock). The resolver refuses + flags the clash; a later reconcile syncs the
+	// subtree once the clash is gone.
+	if (lLeaf && rDir) || (rLeaf && lDir) {
+		e := DiffEntry{Path: path}
+		if lLeaf {
+			e.Local = l.leaf
+			e.RemoteDir = true
+		} else {
+			e.Remote = r.leaf
+			e.LocalDir = true
+		}
+		*out = append(*out, e)
+		return
 	}
 
 	// Recurse the union of child names (sorted for deterministic output). The

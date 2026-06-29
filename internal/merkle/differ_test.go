@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/haider-toha/merkle-sync/internal/pathnorm"
 )
 
 // TestDiff_IdenticalTreesEmpty: equal trees produce an empty diff and prune at the
@@ -101,6 +103,101 @@ func TestDiff_RemoteOnlySubtreeRecursedToLeaves(t *testing.T) {
 	}
 	if !got["new/a.txt"] || !got["new/b.txt"] || len(got) != 2 {
 		t.Errorf("expected new/a.txt and new/b.txt as candidates, got %v", got)
+	}
+}
+
+// TestDiff_FileVsDirTypeClash — MK-2 refutation fix (Phase 7): when the same path is
+// a FILE on one side and a DIRECTORY on the other, the differ must NOT emit a FALSE
+// "absent" candidate (Remote=nil over a path the remote holds as a directory) and must
+// NOT recurse the directory subtree into impossible single-sided installs. Instead it
+// emits exactly ONE truthful clash entry — the file leaf on its side, the *Dir flag on
+// the directory side, the other side nil — and prunes the subtree (minimal comparison
+// count). Covers both directions and a multi-file subtree; one case uses a canonicalised
+// Windows-hostile key to show the clash carries the canonical path faithfully.
+// (decisions/phase7/MK-2-file-vs-dir-typeclash-resolution.md)
+func TestDiff_FileVsDirTypeClash(t *testing.T) {
+	hostile, err := pathnorm.CanonicalizeSlash("COM1.txt") // a reserved name; canonical key is path-content-agnostic to the clash
+	if err != nil {
+		t.Fatalf("canonicalise: %v", err)
+	}
+	cases := []struct {
+		name           string
+		local, remote  []FileInfo
+		clashPath      string
+		wantLocalDir   bool // the local side is the directory (remote is the file leaf)
+		wantRemoteDir  bool // the remote side is the directory (local is the file leaf)
+		wantComparison int  // root(1) + clash node(1, pruned) = 2; recursing the dir would add ≥1
+	}{
+		{
+			name:           "local-file-vs-remote-dir",
+			local:          []FileInfo{leaf("foo", "i-am-a-file")},
+			remote:         []FileInfo{leaf("foo/bar.txt", "i-am-in-a-dir")},
+			clashPath:      "foo",
+			wantRemoteDir:  true,
+			wantComparison: 2,
+		},
+		{
+			name:           "local-dir-vs-remote-file (symmetric)",
+			local:          []FileInfo{leaf("foo/bar.txt", "i-am-in-a-dir")},
+			remote:         []FileInfo{leaf("foo", "i-am-a-file")},
+			clashPath:      "foo",
+			wantLocalDir:   true,
+			wantComparison: 2,
+		},
+		{
+			name:           "deeper-subtree-pruned",
+			local:          []FileInfo{leaf("x", "iam-file")},
+			remote:         []FileInfo{leaf("x/a.txt", "a"), leaf("x/sub/b.txt", "b")},
+			clashPath:      "x",
+			wantRemoteDir:  true,
+			wantComparison: 2, // the whole x/ subtree (a.txt, sub, sub/b.txt) is pruned by the clash
+		},
+		{
+			name:           "windows-hostile-clash-key",
+			local:          []FileInfo{leaf(hostile, "file-on-mac")},
+			remote:         []FileInfo{leaf(hostile+"/inner.bin", "dir-on-win")},
+			clashPath:      hostile,
+			wantRemoteDir:  true,
+			wantComparison: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, comparisons := diffCounted(mustTree(t, tc.local), mustTree(t, tc.remote))
+			if len(entries) != 1 {
+				t.Fatalf("expected exactly ONE clash entry (subtree pruned), got %d: %+v", len(entries), entries)
+			}
+			e := entries[0]
+			if e.Path != tc.clashPath {
+				t.Errorf("clash path = %q, want %q", e.Path, tc.clashPath)
+			}
+			if !e.IsTypeClash() {
+				t.Errorf("entry should report IsTypeClash(): %+v", e)
+			}
+			if e.LocalDir != tc.wantLocalDir || e.RemoteDir != tc.wantRemoteDir {
+				t.Errorf("dir flags = (Local %v, Remote %v), want (Local %v, Remote %v)", e.LocalDir, e.RemoteDir, tc.wantLocalDir, tc.wantRemoteDir)
+			}
+			// The directory side's *FileInfo is nil (a dir has no leaf), but the path is
+			// NOT absent there — the *Dir flag says so. The file side carries its leaf.
+			if tc.wantRemoteDir {
+				if e.Local == nil {
+					t.Errorf("file side (Local) must carry the file leaf, got nil")
+				}
+				if e.Remote != nil {
+					t.Errorf("directory side (Remote) must be nil, got %+v", e.Remote)
+				}
+			} else { // wantLocalDir
+				if e.Remote == nil {
+					t.Errorf("file side (Remote) must carry the file leaf, got nil")
+				}
+				if e.Local != nil {
+					t.Errorf("directory side (Local) must be nil, got %+v", e.Local)
+				}
+			}
+			if comparisons != tc.wantComparison {
+				t.Errorf("comparisons = %d, want %d (the directory subtree must be pruned, not recursed)", comparisons, tc.wantComparison)
+			}
+		})
 	}
 }
 

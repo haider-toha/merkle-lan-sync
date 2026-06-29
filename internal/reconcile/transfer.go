@@ -38,6 +38,16 @@ var (
 	// an existing, fold-equal file under a DIFFERENT canonical key on a case/
 	// normalisation-insensitive target (CDD-5, XP-4) — never overwritten.
 	ErrCaseClobber = errors.New("reconcile: refused case/normalisation clobber")
+	// ErrTypeClash is the refuse+flag verdict for a file-vs-directory divergence: one
+	// peer holds a FILE at a path the other holds as a DIRECTORY (a file deleted +
+	// recreated as a dir of the same name, or a Mac↔Windows structural divergence).
+	// The two are irreconcilable at one path without choosing a loser, so v1 REFUSES to
+	// apply either side — both peers keep their own data (no loss), the path is left
+	// divergent and FLAGGED, exactly like the case/normalisation no-clobber refuse
+	// (CDD-5). The differ reports it via DiffEntry.IsTypeClash (MK-2); auto keep-both
+	// (directory wins, file -> .sync-conflict copy) is the logged forward path
+	// (decisions/phase7/MK-2-file-vs-dir-typeclash-resolution.md).
+	ErrTypeClash = errors.New("reconcile: refused file-vs-directory type clash")
 )
 
 // numBlocks is the number of 32 KiB blocks a file of size bytes splits into (0 for an

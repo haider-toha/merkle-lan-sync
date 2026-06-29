@@ -224,6 +224,35 @@ Steps:
 
 ---
 
+## 9. File ↔ directory type clash — refuse + flag  — MK-2 (Phase 7), SR-7
+
+A path can legitimately be a **file** on one box and a **directory** on the other —
+e.g. macOS has `notes` as a file while Windows has `notes\` containing files (a delete
++ recreate-as-dir, or two independent creates). The two are irreconcilable at one path
+without choosing a loser. v1 **refuses + flags** (no data lost; both keep their own),
+exactly like the case-clobber refuse — never an impossible `mkdir`/`rename` retry loop.
+The differ reports the clash truthfully (`internal/merkle/differ.go`
+`DiffEntry.IsTypeClash`); the engine refuses it (`internal/reconcile/engine.go`
+`flagTypeClash` → `ErrTypeClash`). Decision:
+`docs/audit/decisions/phase7/MK-2-file-vs-dir-typeclash-resolution.md`.
+
+Steps (with both daemons connected):
+1. On **macOS** create a **file** `notes` ("mac file") in the sync root.
+2. On **Windows** create a **directory** `notes\` containing `notes\inner.txt`
+   ("win dir child"). Let it quiesce.
+
+- [ ] **PASS:** each daemon **logs** `refused file-vs-directory type clash` naming
+  `notes`; **no daemon crashes, no sustained retry churn** (no repeated mkdir/rename
+  failures).
+- [ ] **PASS (no data loss):** macOS still has its file `notes` byte-intact; Windows
+  still has `notes\inner.txt` byte-intact. Nothing is deleted or overwritten on either
+  side. (The path stays divergent and flagged — resolve by hand by renaming one side.)
+- [ ] **PASS (recovery):** after renaming the macOS file `notes` → `notes-mac`, the
+  next reconcile converges: both boxes end with `notes-mac` (file) **and** `notes/inner.txt`
+  (dir) — the previously-pruned subtree now syncs.
+
+---
+
 ## Sign-off
 
 | # | Area | Result (PASS/FAIL) | Notes / log excerpt |
@@ -236,6 +265,7 @@ Steps:
 | 6 | Path separators / deep tree | | |
 | 7 | Watcher overflow → rescan | | |
 | 8 | Atomic transfer kill | | |
+| 9 | File↔directory type clash refuse | | |
 
 **Box is cross-OS-signed-off only when every row is PASS.** File any FAIL as a
 finding under `docs/audit/findings/crossplatform/` with the log excerpt and the
