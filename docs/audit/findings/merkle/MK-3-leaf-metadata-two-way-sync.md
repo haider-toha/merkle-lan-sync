@@ -2,7 +2,12 @@
 
 - Slug: `MK-3-leaf-metadata-two-way-sync`
 - Phase / role: Phase 2 — merkle-researcher (the task's CRITICAL deliverable)
-- Status: complete; backs `decisions/merkle/leaf-shape-and-structural-hash.md`
+- Status: **fixed** (WS-1) — the two-way `FileInfo` leaf (content_hash + size + mode
+  + mtime + version_vector + deleted) is implemented in `internal/merkle/fileinfo.go`
+  with the structural hash committing to {content_hash, 2-state mode, deleted, VV} and
+  excluding raw mode/mtime/size; tombstone-distinct-hash test green. Commit
+  `__WS1_SHA__`. (Originally: complete; backs
+  `decisions/merkle/leaf-shape-and-structural-hash.md`.)
 - Severity: **high** (getting the leaf metadata wrong = silent data loss or
   permanent non-convergence; this is the load-bearing definition of two-way sync)
 - Date / access date for all URLs: 2026-06-28

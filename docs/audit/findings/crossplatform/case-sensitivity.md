@@ -1,5 +1,12 @@
 # Cross-platform finding — Case sensitivity (File.txt vs file.txt) without clobber
 
+> **WS-1 status (detection done, Mac-side):** the fold-and-normalise collision index
+> (`Fold` = `cases.Fold(NFC(name))`, `FoldIndex.Add`) is implemented in
+> `internal/pathnorm/casefold.go` and catches both case and normalisation collisions
+> under test. The no-clobber ENFORCEMENT is the filesystem's own verdict on the WS-4
+> apply path (CDD-5), and the real NTFS `$UpCase` matrix is Phase-6. Commit
+> `__WS1_SHA__`.
+
 - Slug: `case-sensitivity` · confirms **XP-4**
 - Phase: 2 (crossplatform-researcher, elevated track)
 - Reads-first: `docs/audit/rules/crossplatform-rules.md` (XP-1..XP-6), rest of

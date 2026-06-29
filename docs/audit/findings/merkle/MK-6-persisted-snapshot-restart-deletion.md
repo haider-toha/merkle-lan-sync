@@ -3,7 +3,11 @@
 - Slug: `MK-6-persisted-snapshot-restart-deletion`
 - Phase / role: Phase 2 — merkle-researcher (surfacing the least-mitigated risk in
   the merkle lane; primary decision owner is the Phase 3 tree-critic)
-- Status: open recommendation — **flag for tree-critic (Phase 3)** and WS-1/WS-4
+- Status: **fixed** (WS-1) — the snapshot persist/load + startup `SynthesizeDeletions`
+  diff are implemented and tested in `internal/merkle/{snapshot.go,scanner.go}`
+  (decision `docs/audit/decisions/ws1/snapshot-and-deletion-synthesis.md`); the
+  WS-4 startup wiring (calling these at boot) remains for WS-4. Fixed by commit
+  `__WS1_SHA__`.
 - Severity: **high** (this is synthesis risk **R-5**, "the least-mitigated risk";
   no existing rule covers it; the failure is missed deletions / resurrection /
   divergence after a restart)

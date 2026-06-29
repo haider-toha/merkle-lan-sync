@@ -1,5 +1,11 @@
 # Cross-platform finding — Unicode normalisation (macOS NFD vs Windows/Linux NFC)
 
+> **WS-1 status (fixed, Mac-side):** NFC normalisation per component is implemented
+> in `internal/pathnorm/normalize.go` (`golang.org/x/text/unicode/norm`, pinned
+> v0.27.0 for the go-1.23 baseline) and applied in `Canonicalize`/`CanonicalizeSlash`;
+> NFD->NFC round-trip tests green. The Windows end of the cross-OS round-trip is
+> Phase-6. Commit `__WS1_SHA__`.
+
 - Slug: `unicode-normalization` · confirms **XP-2**
 - Phase: 2 (crossplatform-researcher, elevated track)
 - Reads-first: `docs/audit/rules/crossplatform-rules.md` (XP-1..XP-6), rest of

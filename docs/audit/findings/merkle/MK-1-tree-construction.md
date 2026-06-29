@@ -2,7 +2,13 @@
 
 - Slug: `MK-1-tree-construction`
 - Phase / role: Phase 2 — merkle-researcher
-- Status: complete; backs `decisions/merkle/leaf-shape-and-structural-hash.md`
+- Status: **fixed** (WS-1) — implemented + verified in `internal/merkle/{node.go,
+  codec.go,tree.go}`: RFC-6962 `0x00`/`0x01` domain separation, the byte-exact
+  grammar, n-ary no-duplicate-last, and the one-byte-change minimal-branch property.
+  Golden-vector + cross-platform-root tests green. Decision
+  `docs/audit/decisions/ws1/structural-hash-grammar-finalization.md`. Commit
+  `__WS1_SHA__`. (Originally: complete; backs
+  `decisions/merkle/leaf-shape-and-structural-hash.md`.)
 - Severity: **medium** (the domain-separation gap is a real, cheap-to-close
   hardening of the Phase 0 spec; the construction itself is foundational to SR-5)
 - Date / access date for all URLs: 2026-06-28

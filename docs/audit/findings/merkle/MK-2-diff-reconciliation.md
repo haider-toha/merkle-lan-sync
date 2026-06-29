@@ -2,8 +2,11 @@
 
 - Slug: `MK-2-diff-reconciliation`
 - Phase / role: Phase 2 — merkle-researcher
-- Status: complete; specifies the algorithm in `internal/merkle/differ.go` consumed
-  by `internal/reconcile`
+- Status: **fixed** (WS-1) — the prune-equal/recurse-mismatching differ is
+  implemented in `internal/merkle/differ.go` with the "absence is ambiguous →
+  single-sided candidate" rule and a white-box prune assertion test; the VV/tombstone
+  resolver that consumes it stays in `internal/reconcile` (WS-4). Decision
+  `docs/audit/decisions/ws1/tree-representation-and-differ.md`. Commit `__WS1_SHA__`.
 - Severity: **medium** (foundational to SR-5; two correctness subtleties — "absence
   is ambiguous" and the honest complexity bound — are easy to get wrong)
 - Date / access date for all URLs: 2026-06-28

@@ -1,5 +1,13 @@
 # Cross-platform finding — Filename legality (Windows-illegal chars, reserved names, trailing dot/space, MAX_PATH)
 
+> **WS-1 status (fixed, Mac-side):** the reversible per-component escape
+> (`IsWindowsUnsafe`/`EscapeForWindows`/`UnescapeFromWindows`, MAX_PATH check) is
+> implemented in `internal/pathnorm/windows.go`; the Windows-hostile table
+> round-trips lossless and the escaping is total/injective under test. Decisions
+> `docs/audit/decisions/ws1/pathnorm-api-and-target-model.md`. Commit `__WS1_SHA__`.
+> The actual on-disk write of an escaped name / NTFS ADS / reserved-name rejection /
+> >260 write remain Phase-6 (windows-latest + checklist).
+
 - Slug: `filename-legality` · confirms **XP-3** (and its MAX_PATH sub-item)
 - Phase: 2 (crossplatform-researcher, elevated track)
 - Reads-first: `docs/audit/rules/crossplatform-rules.md` (XP-1..XP-6), the rest of

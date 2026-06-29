@@ -1,5 +1,14 @@
 # Cross-platform finding — mode / mtime / symlink portability (a convergence bug in the leaf shape)
 
+> **WS-1 status (fixed, Mac-side):** the structural hash commits to the portable
+> 2-state mode `{executable, isSymlink}` (not raw mode) in
+> `internal/merkle/{fileinfo.go,node.go,codec.go}`, and symlinks are typed leaves
+> whose content is the hash of the normalised target in `internal/merkle/scanner.go`
+> (not followed); 2-state and symlink-distinct-hash tests green. Decision
+> `docs/audit/decisions/ws1/structural-hash-grammar-finalization.md`. The exec-bit /
+> symlink on-disk behaviour on Windows (incl. refuse+flag on unprivileged) is
+> WS-4/Phase-6. Commit `__WS1_SHA__`.
+
 - Slug: `mode-symlink-portability` · confirms **XP-6** and **amends** the Phase 0
   leaf-shape structural-hash recipe
 - Phase: 2 (crossplatform-researcher, elevated track)

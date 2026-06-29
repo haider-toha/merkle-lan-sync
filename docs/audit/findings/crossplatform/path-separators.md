@@ -1,5 +1,12 @@
 # Cross-platform finding — Path separators (forward-slash relative; never store an OS separator)
 
+> **WS-1 status (fixed, Mac-side):** forward-slash canonical keys with
+> `filepath.ToSlash`/`FromSlash` only at the boundary and `\\?\`/UNC/drive prefix
+> stripping are implemented in `internal/pathnorm/pathnorm.go` (`ToOSPath`/
+> `FromOSPath`/`Canonicalize`, target-parameterised so Windows separators are tested
+> on the Mac); tests green. Deep-tree round-trip on real Windows is Phase-6. Commit
+> `__WS1_SHA__`.
+
 - Slug: `path-separators` · confirms **XP-1**
 - Phase: 2 (crossplatform-researcher, elevated track)
 - Reads-first: `docs/audit/rules/crossplatform-rules.md` (XP-1), `go-rules.md`
