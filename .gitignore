@@ -18,3 +18,8 @@ go.work.sum
 .idea/
 .vscode/
 *~
+
+/writing-style/
+/docs/
+.claude/
+CLAUDE.md
