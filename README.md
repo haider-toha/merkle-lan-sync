@@ -9,11 +9,6 @@ what differs. Written in Go, built and tested for macOS and Windows.
 > The repository was renamed to `merkle-lan-sync`; GitHub redirects, so
 > `go install` and `go build` resolve normally.
 
-### Blog post
-
-A write-up on the design and implementation of this project is at
-<https://www.haidertoha.site/all/merkle-sync>.
-
 ## Features
 
 - Two-peer, serverless sync over the local network
