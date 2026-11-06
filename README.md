@@ -9,20 +9,6 @@ what differs. Written in Go, built and tested for macOS and Windows.
 > The repository was renamed to `merkle-lan-sync`; GitHub redirects, so
 > `go install` and `go build` resolve normally.
 
-## Features
-
-- Two-peer, serverless sync over the local network
-- TLS 1.3 transport with trust-on-first-use (TOFU) device pairing
-- UDP multicast discovery of peers on the LAN
-- Merkle tree diff for bandwidth-efficient reconciliation
-- Version vectors for causal ordering of edits
-- Atomic file apply (temp write, fsync, rename) — no corrupt files on
-  interrupted transfers
-- Conflict copies instead of overwrites — no data loss on concurrent edits
-- Tombstoned deletions — stale peers cannot resurrect removed files
-- Cross-platform path handling (NFC normalisation, reserved-name escaping,
-  case-collision refusal) for macOS and Windows
-
 ## How it works
 
 Each peer scans its folder into a Merkle tree whose leaves carry a content hash,
