@@ -98,39 +98,3 @@ Windows shortly after. Edit it on Windows, the Mac picks up the change. Delete
 it on one side, it disappears on the other. Kill either side mid-transfer with
 `Ctrl-C`; the partial file is discarded, the destination is untouched and
 syncing resumes cleanly on restart.
-
-## Repository layout
-
-```
-cmd/msync/         Daemon entrypoint.
-internal/pathnorm/ Canonical forward-slash NFC path handling.
-internal/protocol/ Framing, message types, version vectors. Leaf package.
-internal/merkle/   Tree construction, leaf shape, structural hash, differ.
-internal/transport TCP listener, TLS 1.3, allowlist, Hello handshake.
-internal/discovery UDP multicast announce and peer registry.
-internal/reconcile The engine. The only package that mutates tree state.
-test/integration/  Two-instance convergence, conflict and killed-transfer tests.
-```
-
-`protocol` and `pathnorm` are leaves. `reconcile` is the only package that
-mutates tree state. A single `sync.RWMutex` guards the tree, with no I/O
-performed under the lock. Every goroutine has a `WaitGroup` owner so a peer
-disconnect cannot leak it.
-
-## Testing
-
-```sh
-go test ./... -race -count=1
-GOOS=windows GOARCH=amd64 go build ./cmd/msync
-```
-
-The race detector is mandatory. CI runs ubuntu, macOS and Windows in parallel,
-because a meaningful fraction of the bugs only surface on NTFS.
-
-## Status
-
-Functional and tested end to end between macOS and Windows on the same LAN,
-including concurrent edits, deletions and transfers interrupted mid-stream. It
-is intentionally not a Syncthing replacement. One folder, two peers, no UI. If
-you need more than two peers, selective sync or file versioning, use
-Syncthing.
